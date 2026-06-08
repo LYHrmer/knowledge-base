@@ -1,0 +1,225 @@
+---
+title: "第 14 课：World Models / Dreamer"
+difficulty: 3
+prereq: []
+---
+# 第 14 课：World Models / Dreamer
+**导航**: [← L13 Diffusion](13_diffusion_policy.md) · [目录](README.md) · [L15 VLA →](15_vla.md)
+
+> **前置数学**：[00b §6 联合 / 条件概率](00b_math_primer.md#6-联合概率--条件概率) · [§8 KL 散度](00b_math_primer.md#8-熵--kl-散度) · [§9 重参数化](00b_math_primer.md#9-重参数化技巧)
+
+> RL 之所以慢，是因为它"在物理世界里试错"。
+> World Model 的思路：**学一个环境的模型，让策略在"想象的世界"里训练**。
+> Dreamer V3（2024）零样本拿下 Minecraft 钻石，证明了这条路的潜力。
+
+> **前情提要**: 之前都是 model-free RL。这一课换思路：先学环境模型，再在'梦'里训策略。
+
+---
+
+## 14.1 Model-based RL 的两条路线
+
+### 路线 A：Planning（MCTS / MuZero）
+- 学环境模型
+- 用模型做搜索（蒙特卡洛树）找最优动作
+- 代表：AlphaZero, MuZero
+- 缺点：连续动作空间难做树搜索
+
+### 路线 B：Imagination（Dreamer）
+- 学环境模型
+- 把模型当 simulator，用 actor-critic 在里面训练
+- 代表：World Models (Ha 2018), Dreamer V1/V2/V3
+- 优点：自然支持连续控制
+
+机器人主流是路线 B。
+
+---
+
+## 14.2 Ha & Schmidhuber 2018 World Models
+
+经典三件套：
+1. **VAE (V)**：把图像压缩成低维 latent z
+2. **MDN-RNN (M)**：在 latent 空间预测下一帧 z_{t+1}
+3. **Controller (C)**：基于 (z_t, h_t) 决策
+
+训练流程：
+1. 随机策略采集环境数据
+2. 训 V 重建图像
+3. 训 M 在 V 的 latent 上预测下一步
+4. 在 M 的 imagined rollout 里训 C（用 CMA-ES 或 PPO）
+
+惊人发现：完全在"梦里"训出来的策略，迁回真环境能用。
+
+---
+
+## 14.3 Dreamer 演化
+
+### Dreamer V1 (ICLR 2020)
+- 用学到的 world model 在 latent 空间做 actor-critic
+- DreamerV1 能在 26 个连续控制任务上 sota
+
+### Dreamer V2 (ICLR 2021)
+- 关键改进：latent 用**离散** categorical（不是连续高斯）
+- 在 Atari 上超过人类，且**只用 single GPU 训练**
+- 离散 latent 让 world model 更容易拟合复杂环境
+
+### Dreamer V3 (Nature 2024)
+- 单一超参集解决 150+ 任务
+- **零样本拿下 Minecraft 钻石**（之前只有人工 reward shaping 才能做到）
+- 引入 KL balancing、symlog 变换等稳定性技巧
+
+---
+
+## 14.4 RSSM 架构（Recurrent State-Space Model）
+
+Dreamer 的 world model 核心。state 拆两部分：
+- **deterministic** $h_t$：RNN 隐状态（固定动力学）
+- **stochastic** $z_t$：每步采样的离散 categorical（不确定性）
+
+```
+观测 o_t                   下一观测 o_{t+1}
+   │                            ▲
+   ▼                            │
+[ Encoder ]              [ Decoder ]
+   │                            ▲
+   ▼                            │
+   z_t ─→ h_t+1 = RNN(h_t, z_t, a_t) ─→ z_{t+1} (prior or posterior)
+```
+
+Posterior（看到 o）和 Prior（没看到）的 KL 散度是关键损失项。
+
+### 数学补丁：KL 散度
+
+$$
+D_{KL}(p \| q) = \sum_x p(x) \log \frac{p(x)}{q(x)}
+$$
+
+直观：用 q 编码 p 多花的比特数。
+- p == q：KL = 0
+- p 和 q 完全不同：KL 大
+- **不对称**：D(p||q) ≠ D(q||p)
+
+Dreamer 让 prior 学着接近 posterior（让"没看到"的预测接近"看到"的判断）。
+
+---
+
+## 14.5 训练流程（三阶段循环）
+
+```
+Phase 1: 真实环境交互
+   用当前策略在真环境跑一段，存到 replay
+   (这部分时间可以很少，只为补充新样本)
+
+Phase 2: 训 World Model
+   从 replay 采样轨迹
+   联合训：encoder + decoder + RNN + reward predictor
+   loss = recon_loss + reward_loss + KL(post || prior)
+
+Phase 3: 想象训练 (核心)
+   从 replay 取 state，把它当"梦的起点"
+   在 world model 里 rollout 15-50 步（不接真环境）
+   用想象的 (s, a, r, s') 训 actor-critic
+```
+
+Phase 2 + Phase 3 占绝大部分计算。Phase 1 在真机上做，可以少到每 1000 步只更新一次。
+
+---
+
+## 14.6 简化代码骨架
+
+```python
+class TinyWorldModel(nn.Module):
+    def __init__(self, obs_dim, act_dim, latent_dim=32):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(obs_dim, 128), nn.ELU(),
+            nn.Linear(128, latent_dim*2),  # μ, logσ
+        )
+        self.rnn = nn.GRUCell(latent_dim + act_dim, 128)
+        self.prior = nn.Linear(128, latent_dim*2)
+        self.decoder = nn.Sequential(
+            nn.Linear(128 + latent_dim, 128), nn.ELU(),
+            nn.Linear(128, obs_dim),
+        )
+        self.reward_head = nn.Linear(128 + latent_dim, 1)
+
+    def encode(self, obs):
+        params = self.encoder(obs)
+        μ, logσ = params.chunk(2, -1)
+        return torch.distributions.Normal(μ, logσ.exp())
+
+    def step(self, h, z, a):
+        h_new = self.rnn(torch.cat([z, a], -1), h)
+        prior_p = self.prior(h_new).chunk(2, -1)
+        prior = torch.distributions.Normal(prior_p[0], prior_p[1].exp())
+        return h_new, prior
+
+def imagine_train(model, actor, critic, init_states, horizon=15):
+    h, z = init_states
+    rewards, values, log_probs = [], [], []
+    for _ in range(horizon):
+        feature = torch.cat([h, z], -1)
+        a_dist = actor(feature)
+        a = a_dist.rsample()
+        log_probs.append(a_dist.log_prob(a))
+        values.append(critic(feature))
+        rewards.append(model.reward_head(feature))
+        h, prior = model.step(h, z, a)
+        z = prior.rsample()
+    return imagine_actor_critic_loss(rewards, values, log_probs)
+```
+
+完整实现：https://github.com/danijar/dreamerv3
+
+---
+
+## 14.7 DayDreamer (CoRL 2022)：真机训练
+
+Dreamer V2 直接在 4 个真实机器人上训练（包括四足机器狗 1h 学会走路）。这是 World Model 的杀手级应用：**样本效率高，能在物理设备上训**。
+
+对焊接的启示：如果你的仿真精度不够，World Model 让你能在**有限的真机数据**上训出策略。
+
+---
+
+## 14.8 Diffusion Policy vs World Model
+
+| 维度 | Diffusion Policy | Dreamer/World Model |
+|---|---|---|
+| 数据 | 人示教 | 自己在线收集 |
+| 范式 | 模仿学习 | Model-based RL |
+| 适合任务 | 短任务、多模态 | 长任务、需探索 |
+| 生成 | 动作 | 环境模型 |
+| 推理慢吗 | 慢（多步去噪）| 快（actor 直接出动作）|
+
+实际可以**组合**：用 World Model 做 RL，用 Diffusion 当策略表达。这是 2024-2025 的活跃方向。
+
+---
+
+## 14.9 应用到焊接：现实判断
+
+**为什么暂时不推荐**：
+- 焊接环境复杂（视觉 + 物理 + 焊接电弧），World Model 难学准
+- 训练复杂度极高（Dreamer V3 训练代码难驾驭）
+- 焊接已经有大量人示教，BC + RL fine-tuning 性价比高得多
+
+**什么时候考虑**：
+- 任务非常长（焊一段、搬运、再焊一段）
+- 仿真不可能精确（电磁、热变形）
+- 你的团队有专门的 ML 工程师能维护 Dreamer 代码
+
+---
+
+## 本课收获
+
+> Dreamer 的样本效率压倒一切——真机训练 1 小时学会四足走路。但工程复杂度也是顶级。
+
+## 14.10 思考题
+
+1. World Model 学不准会怎样？想象训练时策略会被引导到哪？
+2. 为什么 Dreamer 要用离散 latent 而不是连续高斯？
+3. KL(posterior || prior) vs KL(prior || posterior) 的对称性问题，在 Dreamer 里怎么处理？
+4. World Model 的 reward predictor 错了，actor-critic 训出来的策略会怎样？这种 bug 怎么发现？
+5. **开放题**：你想用 Dreamer 训焊接，最大的工程难点是什么？给三个具体问题。
+
+---
+
+下一课：[第 15 课：VLA](15_vla.md)

@@ -1,0 +1,172 @@
+---
+title: "符号速查表"
+difficulty: 1
+prereq: []
+---
+# 符号速查表
+
+> RL 公式里那些字母满天飞。这一份按"看到 X 应该想到什么"组织。
+> 有疑问就 Ctrl+F 搜符号。
+
+---
+
+## 状态空间
+
+| 符号 | 含义 | 常出现 |
+|---|---|---|
+| s, $s_t$ | 状态 (state) | 全程 |
+| s' 或 $s_{t+1}$ | 下一个状态 | Bellman 方程 |
+| S | 状态空间（所有可能状态的集合） | L1 |
+| obs, o | 观测（部分可观测时 ≠ 状态） | L8, L14 |
+
+## 动作空间
+
+| 符号 | 含义 | 常出现 |
+|---|---|---|
+| a, $a_t$ | 动作 (action) | 全程 |
+| A | 动作空间 | L1 |
+| u | 控制量（控制论习惯）| L9 LQR/MPC |
+| $a_w, a_l$ | 偏好 winner / loser | L16 RLHF |
+
+## 奖励 / 回报
+
+| 符号 | 含义 | 常出现 |
+|---|---|---|
+| r, $r_t$ | 即时 reward | 全程 |
+| R, $R(\tau)$ | 整条轨迹 reward 和 | L4-L6 |
+| $G_t$ | 从 t 开始的折扣累积 reward | L1 |
+| γ | 折扣因子 (∈ [0,1)) | 全程 |
+
+## 价值函数
+
+| 符号 | 含义 | 常出现 |
+|---|---|---|
+| $V^\pi(s)$ | 状态价值（在 s 按 π 走的期望回报）| L1 |
+| $V^*(s)$ | 最优状态价值 | L1, L9 |
+| $Q^\pi(s, a)$ | 动作价值 | L2, L3 |
+| $Q^*(s, a)$ | 最优动作价值 | L2, L3 |
+| $A(s, a)$ | 优势（advantage）= Q - V | L5, L6 |
+| $V_\phi$ | 用网络逼近的 V，参数 φ | L5+ |
+| $Q_\phi$ | 用网络逼近的 Q | L3, L10 |
+| $Q_{\phi^-}$ | target Q 网络（冻结一段）| L3 |
+| $\delta_t$ | TD error | L5, L6 |
+
+## 策略
+
+| 符号 | 含义 | 常出现 |
+|---|---|---|
+| π | 策略（state → action 的概率分布）| 全程 |
+| $\pi(a\|s)$ | 在 s 选 a 的概率 | 全程 |
+| $\pi_\theta$ | 参数为 θ 的策略 | L4+ |
+| $\pi^*$ | 最优策略 | L1 |
+| $\pi_{\text{SFT}}$ | Supervised fine-tuning 后的策略 | L16 |
+| $\pi_{\text{old}}$ | 旧策略（PPO importance ratio）| L6 |
+
+## 概率
+
+| 符号 | 含义 | 常出现 |
+|---|---|---|
+| P, p | 概率 | 全程 |
+| $P(s'\|s, a)$ | 转移概率（动力学）| L1 |
+| $\sim$ | 服从分布 (a ~ N(0,1) 读 "a 服从标准正态")| 全程 |
+| $\mathbb{E}$ | 期望 | 全程 |
+| $\mathbb{E}_{x \sim p}$ | x 从 p 采样的期望 | 全程 |
+| Var | 方差 | L4, L5 |
+
+## 学习参数
+
+| 符号 | 含义 | 常出现 |
+|---|---|---|
+| θ | 策略网络参数 | L4+ |
+| φ | 价值网络参数 | L5+ |
+| α | 学习率（optimizer）OR SAC 熵系数 OR DPO/RLHF 系数 | 看上下文 |
+| β | KL 惩罚系数 | L16 |
+| ε | ε-greedy 探索率 OR PPO clip 范围 | L2/L3 vs L6 |
+| τ | 轨迹 OR target 软更新系数 | 看上下文 |
+| λ | GAE 平滑系数 | L6 |
+
+## 数学操作符
+
+| 符号 | 含义 |
+|---|---|
+| $\nabla_\theta$ | 对 θ 求梯度 |
+| $\partial$ | 偏导（多变量函数对单变量求导）|
+| $\arg\max$ | 取最大值对应的输入（"哪个 x 让 f 最大"）|
+| $\sigma(x)$ | sigmoid 函数 = $\frac{1}{1+e^{-x}}$ |
+| $\log$ | 自然对数（默认 e 为底）|
+| $\sum$ | 求和 |
+| $\int$ | 积分（连续版求和）|
+| $\circ$ | 函数复合 |
+
+## 分布与信息论
+
+| 符号 | 含义 | 常出现 |
+|---|---|---|
+| $\mathcal{N}(\mu, \sigma)$ | 高斯分布 | L4+ |
+| $\mathcal{H}(p)$ | 分布 p 的熵 | L10, L14 |
+| $D_{KL}(p\|\|q)$ | KL 散度 | L6, L10, L14, L16 |
+
+## PPO / 策略梯度专属
+
+| 符号 | 含义 |
+|---|---|
+| $r_t(\theta)$ | importance ratio = $\pi_\theta(a)/\pi_{old}(a)$（注意：和 reward $r_t$ 同符号但完全不同！）|
+| clip(x, a, b) | 把 x 截断到 [a, b] |
+
+## LQR / 控制专属
+
+| 符号 | 含义 |
+|---|---|
+| A, B | 线性系统矩阵 $x' = Ax + Bu$ |
+| Q, R | 二次代价矩阵（这里 R 不是 reward，是控制代价！）|
+| K | LQR 反馈增益矩阵 |
+| P | Riccati 方程的解 |
+
+## 在线 vs 离线
+
+| 词 | 含义 |
+|---|---|
+| **on-policy** | 策略只能用自己采的数据训（PPO, A2C）|
+| **off-policy** | 策略能用别的策略采的数据训（DQN, SAC）|
+| **online** | 能和环境实时交互 |
+| **offline** | 只能用已有数据集，不能再采 |
+
+注意 on/off-policy 和 online/offline 是**两个独立的维度**：
+- online + on-policy = PPO
+- online + off-policy = SAC, DQN
+- offline + off-policy = BCQ, IQL（offline RL）
+- offline + on-policy 基本不存在（自相矛盾）
+
+---
+
+## 容易混淆的符号
+
+| 现象 | 区别 |
+|---|---|
+| **R** vs **R** | reward / 控制代价矩阵（LQR）。看上下文 |
+| **r** vs **r** | reward / importance ratio（PPO）。L6 里满屏都是 r，一定看维度 |
+| **Q** vs **Q** | 动作价值函数 / LQR 状态代价矩阵 |
+| **τ** vs **τ** | 轨迹 / target soft update 系数（SAC）|
+| **α** vs **α** | 学习率 / SAC 熵系数 / RLHF KL 系数。这字母被滥用了 |
+| **π** | 数学常数 3.14 几乎不会出现，全是策略 |
+
+---
+
+## 一张图：RL 主公式回顾
+
+```
+Bellman:        V(s) = E[r + γ V(s')]
+                Q(s,a) = E[r + γ max_a' Q(s',a')]
+
+策略梯度:        ∇J = E[∇log π(a|s) · A(s,a)]
+
+GAE:            A_t = Σ_l (γλ)^l δ_{t+l},  δ_t = r + γV(s') - V(s)
+
+PPO clip:       L = E[min(ρ A, clip(ρ, 1-ε, 1+ε) A)],  ρ = π/π_old
+
+SAC actor:      L = E[α log π(a|s) - Q(s,a)]
+
+Bradley-Terry:  P(A>B) = σ(R(A) - R(B))
+```
+
+需要解释回去看相应课程或 [00b_math_primer](00b_math_primer.md)。

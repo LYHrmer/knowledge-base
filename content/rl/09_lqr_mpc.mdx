@@ -1,0 +1,193 @@
+---
+title: "第 9 课：LQR / MPC —— 桥接经典控制"
+difficulty: 2
+prereq: []
+---
+# 第 9 课：LQR / MPC —— 桥接经典控制
+**导航**: [← L08 DR + ROS2](08_domain_rand_ros2.md) · [目录](README.md) · [L10 SAC ★ →](10_sac.md)
+
+> **前置数学**：[00b §1 函数 / 梯度](00b_math_primer.md#1-函数--导数--梯度) · [§7 矩阵 / 二次型 / 正定](00b_math_primer.md#7-矩阵--向量--二次型)
+
+> 你是工程师，肯定接触过 PID。这一课讲两个比 PID 强得多的经典最优控制方法：**LQR**（线性二次调节器）和 **MPC**（模型预测控制）。
+> 它们和 RL 的关系：**LQR 就是线性高斯系统下 RL 的解析解**。理解这一点，你看 RL 就是在解一类"复杂非线性 LQR"。
+
+> **前情提要**: 如果你能写出动力学方程，RL 大材小用。这一课讲两个老前辈：LQR 和 MPC。
+
+---
+
+## 9.1 控制问题统一形式
+
+考虑离散时间系统：
+
+$$
+x_{t+1} = f(x_t, u_t)
+$$
+
+其中 $x_t$ 是状态（位置、速度），$u_t$ 是控制（力、力矩）。
+**目标**：找一个控制序列 $u_0, u_1, \ldots$ 使某个代价最小：
+
+$$
+J = \sum_{t=0}^{T-1} c(x_t, u_t) + c_f(x_T)
+$$
+
+如果你把 $-c$ 当 reward，这个问题**就是 RL 的有限期 MDP**！区别在于 RL 一般认为 f 未知，控制论假设 f 已知。
+
+---
+
+## 9.2 LQR：线性 + 二次的解析解
+
+**线性系统**：$x_{t+1} = A x_t + B u_t$
+**二次代价**：$c(x, u) = x^T Q x + u^T R u$
+- Q 半正定（不惩罚 x=0）
+- R 正定（控制总有代价）
+
+### 数学补丁：什么是二次型 / 正定？
+
+$x^T Q x = \sum_{ij} Q_{ij} x_i x_j$ 是 x 的二次函数。
+- Q 正定：对任意 x≠0，$x^T Q x > 0$（碗状凸函数）
+- 直观：Q 把状态转换成"距原点的代价"
+
+**Riccati 方程**给出最优策略的解析形式：
+
+$$
+P_t = Q + A^T P_{t+1} A - A^T P_{t+1} B (R + B^T P_{t+1} B)^{-1} B^T P_{t+1} A
+$$
+
+最优控制：
+$$
+u_t^* = -K_t x_t, \quad K_t = (R + B^T P_{t+1} B)^{-1} B^T P_{t+1} A
+$$
+
+**结论**：最优控制是状态的线性反馈！只需算出 K 矩阵，部署时一个矩阵乘法搞定。
+
+---
+
+## 9.3 LQR 代码：质量-弹簧系统
+
+```python
+import numpy as np
+from scipy.linalg import solve_discrete_are
+import matplotlib.pyplot as plt
+
+# 系统：m*ẍ + b*ẋ + k*x = u
+# 状态 [x, ẋ]，离散化（dt=0.05）
+m, b, k, dt = 1.0, 0.5, 2.0, 0.05
+A = np.array([[1, dt],
+              [-k/m*dt, 1 - b/m*dt]])
+B = np.array([[0],
+              [dt/m]])
+
+Q = np.diag([10, 1])     # 位置误差权重大
+R = np.array([[0.1]])    # 控制代价小
+
+# 解 Riccati 拿到稳态 P
+P = solve_discrete_are(A, B, Q, R)
+K = np.linalg.inv(R + B.T @ P @ B) @ B.T @ P @ A
+print("K =", K)   # 形如 [[K_x, K_v]]
+
+# 仿真
+x = np.array([2.0, 0.0])  # 初始位置 2，速度 0，目标回原点
+log = []
+for t in range(200):
+    u = -K @ x
+    x = A @ x + B.flatten() * u[0]
+    log.append((x[0], x[1], u[0]))
+log = np.array(log)
+
+plt.figure(figsize=(10,4))
+plt.subplot(121); plt.plot(log[:,0], label="x"); plt.plot(log[:,1], label="v"); plt.legend(); plt.title("State")
+plt.subplot(122); plt.plot(log[:,2]); plt.title("Control u")
+plt.tight_layout(); plt.show()
+```
+
+输出：x 平滑收敛到 0，control 早期大后期小。这就是**线性二次最优控制**。
+
+---
+
+## 9.4 MPC：每步重新规划
+
+LQR 假设系统全程线性。真实系统通常非线性，且有约束（关节限位、力矩饱和）。
+
+**MPC（Model Predictive Control）的核心**：
+1. 当前 t，用模型预测未来 N 步
+2. 解一个优化问题：找 $u_t, u_{t+1}, \ldots, u_{t+N-1}$ 最小化预测代价
+3. 只执行 $u_t$
+4. t+1 时刻再来一次
+
+每步都重新规划，所以叫 **receding horizon**。能处理非线性 + 约束。
+
+代码示意（用 cvxpy 这类凸优化库）：
+
+```python
+import cvxpy as cp
+import numpy as np
+
+def mpc_step(x_now, A, B, Q, R, N=20, u_max=5.0):
+    n_x = A.shape[0]
+    n_u = B.shape[1]
+    x = cp.Variable((n_x, N+1))
+    u = cp.Variable((n_u, N))
+    cost = 0
+    constraints = [x[:,0] == x_now]
+    for t in range(N):
+        cost += cp.quad_form(x[:,t], Q) + cp.quad_form(u[:,t], R)
+        constraints.append(x[:,t+1] == A @ x[:,t] + B @ u[:,t])
+        constraints.append(cp.abs(u[:,t]) <= u_max)
+    cost += cp.quad_form(x[:,N], Q)  # terminal cost
+    prob = cp.Problem(cp.Minimize(cost), constraints)
+    prob.solve()
+    return u[:,0].value
+```
+
+每个控制周期调一次。
+
+---
+
+## 9.5 LQR/MPC vs RL 对比
+
+| 维度 | LQR | MPC | RL (PPO) |
+|---|---|---|---|
+| 模型 | 必须有 | 必须有 | 不需要（model-free）|
+| 在线计算 | O(1) 矩阵乘 | 解 QP（毫秒级）| O(1) 神经网络前向 |
+| 处理非线性 | 不行 | 行 | 行 |
+| 约束 | 不行 | 直接加 | 难（CMDP）|
+| 全局最优 | 是（线性）| 局部 | 局部 |
+| 训练时间 | 0 | 0 | 数小时-数天 |
+| 解释性 | 高 | 高 | 低 |
+
+**实际工程选择**：
+- 系统能线性化、约束简单 → LQR
+- 模型已知、能解 QP → MPC
+- 模型复杂或感知主导 → RL
+- **混合**：LQR 做底层稳定 + RL 做高层决策（最强）
+
+---
+
+## 9.6 RL 视角看 LQR
+
+LQR 等价于"无穷期 MDP，线性 dynamics + 二次 reward"。
+- V*(x) = -x^T P x（二次型）
+- π*(x) = -K x（线性策略）
+
+如果你给 RL 算法（比如 SAC）一个 LQR 环境，它**应该**学到接近 -K x 的策略。但因为函数逼近 + 探索，通常多花 100 倍时间得到差不多的结果。
+
+**重要启示**：能用 LQR 做的别用 RL。
+**反过来**：RL 应当用在 LQR 不能用的地方（非线性、视觉、复杂任务）。
+
+---
+
+## 本课收获
+
+> **能 LQR 别 RL**；RL 适用在'模型太复杂或感知主导'的场景。LQR 是线性系统的解析最优解。
+
+## 9.7 思考题
+
+1. LQR 假设系统线性，但你机械臂是非线性的。能不能在工作点附近线性化用 LQR？什么时候这一招会失败？
+2. MPC 的 horizon N 太大太小分别什么后果？联系 GAE 的 λ。
+3. 焊接的"视觉对线"任务为什么不适合 LQR？
+4. 给一个 PPO 训不出来但 LQR 能解的简单任务。
+5. **开放题**：用 MPC 当 RL 的 expert 做 BC 训练（Lesson 11），有什么好处？
+
+---
+
+下一课：[第 10 课：SAC](10_sac.md)

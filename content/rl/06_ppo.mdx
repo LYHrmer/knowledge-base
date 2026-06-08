@@ -1,0 +1,293 @@
+---
+title: "第 6 课：PPO（Proximal Policy Optimization）★难"
+difficulty: 3
+prereq: []
+---
+# 第 6 课：PPO（Proximal Policy Optimization）★难
+**导航**: [← L05 A2C](05_a2c.md) · [目录](README.md) · [L07 自定义 Env →](07_custom_gym_env.md)
+
+> **前置数学**：[00b §5 log 技巧](00b_math_primer.md#5-log-与-log-导数技巧最重要的一节) · [§8 KL 散度](00b_math_primer.md#8-熵--kl-散度) · [§10 重要性采样](00b_math_primer.md#10-重要性采样importance-sampling) · [§11 策略梯度定理](00b_math_primer.md#11-期望的梯度策略梯度定理证明)
+
+> A2C 一条轨迹只用一次太浪费。PPO 的关键是**安全地多次复用同一批数据**。
+> PPO 是 2017 年提出，至今（2026）仍是机器人 RL 的事实标准 baseline。OpenAI 的 ChatGPT RLHF、Isaac Lab 的官方算法都用它。
+
+> **前情提要**: L5 的 A2C 一条数据用一次扔。这一课让数据可以**安全地复用 10 次**。
+
+---
+
+## 6.1 朴素 actor-critic 的痛点
+
+A2C 每收集一批 transition，做一次梯度更新就丢。原因是：
+- **如果用同一批数据多次更新**，策略 π 会越来越远离收集数据的策略 π_old
+- 此时数据"过期"，再用就是有偏估计
+
+PPO 的核心问题：**怎么"正好走到合适的距离就停下"？**
+
+---
+
+## 6.2 重要性采样修正
+
+如果数据是 π_old 收集的，而我们要更新的是 π_θ，期望要做 importance sampling 修正：
+
+$$
+\nabla J(\theta) = \mathbb{E}_{(s,a)\sim \pi_{\text{old}}}\left[\frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)} A(s, a) \nabla_\theta \log \pi_\theta(a|s)\right]
+$$
+
+记 $r_t(\theta) = \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)}$，叫 **likelihood ratio**。
+- $r_t = 1$：和原策略一样
+- $r_t > 1$：新策略给该动作的概率更高
+- $r_t < 1$：更低
+
+---
+
+## 6.3 Clip 损失（PPO 灵魂）
+
+**TRPO**（PPO 前身）用 KL 约束限制策略偏离，需要二阶优化，复杂。
+
+**PPO 的简化**：直接 clip ratio：
+
+$$
+\mathcal{L}^{\text{CLIP}}(\theta) = \mathbb{E}\left[\min\big(r_t A_t,\; \text{clip}(r_t, 1-\epsilon, 1+\epsilon) A_t\big)\right]
+$$
+
+ε 通常 0.2。直观理解：
+
+- 当 A > 0（动作好）：
+  - r 想往上涨，但 clip 把它限制在 1+ε
+  - 防止"一次大跃进"，让策略小步前进
+- 当 A < 0（动作差）：
+  - r 想往下降，clip 限制在 1-ε
+  - 防止"一刀切"全部清零
+
+`min` 的作用：保证只有"clip 让目标变小"时才生效，避免错误激励。
+
+---
+
+## 6.4 GAE（Generalized Advantage Estimation）
+
+A2C 的 1-step advantage 偏差小但方差大；n-step 反过来。**GAE 是两者的平滑插值**：
+
+$$
+A_t^{\text{GAE}(\gamma, \lambda)} = \sum_{l=0}^{\infty}(\gamma\lambda)^l \delta_{t+l}, \quad \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+$$
+
+- λ=0：纯 1-step（高 bias 低 variance）
+- λ=1：纯 Monte Carlo（低 bias 高 variance）
+- λ=0.95：实践 sweet spot
+
+代码（核心 8 行）：
+
+```python
+def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
+    advantages = torch.zeros_like(rewards)
+    last_adv = 0
+    for t in reversed(range(len(rewards))):
+        next_value = values[t+1] if t+1 < len(values) else 0
+        delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+        last_adv = delta + gamma * lam * (1 - dones[t]) * last_adv
+        advantages[t] = last_adv
+    returns = advantages + values
+    return advantages, returns
+```
+
+---
+
+## 6.5 完整 PPO 代码（核心 150 行）
+
+```python
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+import numpy as np
+
+class ActorCritic(nn.Module):
+    def __init__(self, obs_dim, n_act):
+        super().__init__()
+        self.shared = nn.Sequential(nn.Linear(obs_dim, 128), nn.Tanh(),
+                                    nn.Linear(128, 128), nn.Tanh())
+        self.actor = nn.Linear(128, n_act)
+        self.critic = nn.Linear(128, 1)
+    def forward(self, s):
+        h = self.shared(s)
+        return self.actor(h), self.critic(h).squeeze(-1)
+
+env = gym.make("CartPole-v1")
+ac = ActorCritic(4, 2)
+opt = optim.Adam(ac.parameters(), lr=3e-4)
+
+# 超参
+gamma, lam = 0.99, 0.95
+clip_eps = 0.2
+n_steps = 2048      # 一轮收集多少 transition
+n_epochs = 10       # 同一批数据复用几次
+batch_size = 64
+total_timesteps = 200_000
+
+s, _ = env.reset()
+buffer = {"s":[],"a":[],"lp":[],"r":[],"done":[],"v":[]}
+ep_returns = []
+ep_ret = 0
+
+step = 0
+while step < total_timesteps:
+    # === 收集 n_steps 数据 ===
+    for _ in range(n_steps):
+        st = torch.tensor(s, dtype=torch.float32)
+        with torch.no_grad():
+            logits, v = ac(st)
+        dist = Categorical(logits=logits)
+        a = dist.sample()
+        lp = dist.log_prob(a)
+
+        s2, r, term, trunc, _ = env.step(a.item())
+        done = term or trunc
+
+        buffer["s"].append(s); buffer["a"].append(a.item())
+        buffer["lp"].append(lp.item()); buffer["r"].append(r)
+        buffer["done"].append(float(done)); buffer["v"].append(v.item())
+
+        ep_ret += r
+        if done:
+            ep_returns.append(ep_ret); ep_ret = 0
+            s2, _ = env.reset()
+        s = s2
+        step += 1
+
+    # === 计算 GAE ===
+    rewards = torch.tensor(buffer["r"], dtype=torch.float32)
+    values = torch.tensor(buffer["v"] + [0.0], dtype=torch.float32)
+    dones = torch.tensor(buffer["done"], dtype=torch.float32)
+    advantages = torch.zeros_like(rewards)
+    last_adv = 0
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma*values[t+1]*(1-dones[t]) - values[t]
+        last_adv = delta + gamma*lam*(1-dones[t])*last_adv
+        advantages[t] = last_adv
+    returns = advantages + values[:-1]
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+    # === 多轮 epoch 更新 ===
+    states = torch.tensor(np.array(buffer["s"]), dtype=torch.float32)
+    actions = torch.tensor(buffer["a"], dtype=torch.long)
+    old_lp = torch.tensor(buffer["lp"], dtype=torch.float32)
+    n = len(states)
+    for _ in range(n_epochs):
+        idx = np.random.permutation(n)
+        for start in range(0, n, batch_size):
+            b = idx[start:start+batch_size]
+            logits, v = ac(states[b])
+            dist = Categorical(logits=logits)
+            new_lp = dist.log_prob(actions[b])
+            entropy = dist.entropy().mean()
+
+            ratio = (new_lp - old_lp[b]).exp()
+            surr1 = ratio * advantages[b]
+            surr2 = torch.clamp(ratio, 1-clip_eps, 1+clip_eps) * advantages[b]
+            actor_loss = -torch.min(surr1, surr2).mean()
+            critic_loss = (v - returns[b]).pow(2).mean()
+            loss = actor_loss + 0.5*critic_loss - 0.01*entropy
+
+            opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(ac.parameters(), 0.5)
+            opt.step()
+
+    # 清空 buffer
+    for k in buffer: buffer[k] = []
+    print(f"step {step}, last 10 mean return: {np.mean(ep_returns[-10:]):.1f}")
+```
+
+CartPole 大约 5-10 万步能稳定到 500 满分。
+
+---
+
+## 6.6 PPO 工程关键 7 条
+
+| # | 关键技巧 | 重要性 |
+|---|---|---|
+| 1 | Advantage 标准化 | ★★★ |
+| 2 | clip_eps = 0.2 | ★★★ |
+| 3 | Gradient clipping (max_norm=0.5) | ★★ |
+| 4 | n_epochs ∈ [3,10]，太多会 over-fit 当前 batch | ★★★ |
+| 5 | KL early stopping（KL > 0.02 提前结束 epoch） | ★ |
+| 6 | Reward normalization（running mean/std） | ★★ |
+| 7 | Tanh 激活而非 ReLU（PPO 经验，更稳） | ★ |
+
+[The 37 Implementation Details of PPO](https://iclr-blog-track.github.io/2022/03/25/ppo-implementation-details/) 是必读。
+
+---
+
+## 6.7 卡点 FAQ
+
+**Q1：为什么 ratio 用 exp(new_lp - old_lp)？**
+A：$\frac{\pi}{\pi_\text{old}} = \exp(\log\pi - \log\pi_\text{old})$。直接除概率会数值不稳，对数减再 exp 更安全。
+
+**Q2：Advantage 不标准化会怎样？**
+A：可能完全学不动。reward 量级大时 advantage 也大，clip 始终触底，等于不更新。
+
+**Q3：n_epochs 越多越好吗？**
+A：3-10 是甜蜜区。太多导致 ratio 离 1 太远 → clip 频繁触发 → 等效梯度变成 0。
+
+**Q4：连续动作怎么改？**
+A：把 Categorical 换成 Normal，log_std 当可学习参数。其他不变。
+
+**Q5：为什么 PPO 比 SAC 更适合机器人 sim2real？**
+A：on-policy 让策略不会"跑偏"，对 domain randomization 友好；off-policy 的 SAC 在数据噪声大时 Q 估值容易乱。
+
+---
+
+## 6.8 常见 Bug
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| Reward 一直 0 | 没 standardize advantage | `(adv - adv.mean()) / (adv.std()+1e-8)` |
+| 训练曲线跳水 | clip 触发但 advantage 很大 | 降 lr 或减 n_epochs |
+| 学习率显得无效 | gradient clipping 太松 | 加 `clip_grad_norm_(0.5)` |
+| GAE 算反了 | 没 reverse 循环 | 检查 `for t in reversed(range(...))` |
+| 收集了 1 条 episode 就更新 | n_steps 太小 | 设 1024-4096 |
+| done 后没 reset env | 漏了 if done: env.reset() | 仔细看主循环 |
+| 高斯策略 std 衰减到 0 | log_std 没下界 | clip log_std ∈ [-5, 1] |
+
+---
+
+## 6.9 调参手册
+
+| 超参 | 推荐值 | 调节方向 |
+|---|---|---|
+| 学习率 | 3e-4 | 不调 / 不收敛降到 1e-4 |
+| γ | 0.99 | 长任务 0.999 |
+| λ (GAE) | 0.95 | 几乎不调 |
+| clip_eps | 0.2 | 不调 |
+| n_steps | 2048 ~ 4096 | 任务复杂取大 |
+| n_epochs | 10 | 不调 / 难收敛降到 3 |
+| batch_size | 64 ~ 256 | 显存允许就大 |
+| entropy 系数 | 0.01 | 探索不够升到 0.05 |
+| value loss 系数 | 0.5 | 不调 |
+| max_grad_norm | 0.5 | 不调 |
+
+**调参流程**：
+1. 跑默认值
+2. 看 1-5 万步是否上升 → 否则检查 reward 设计
+3. 上升慢 → 加 n_steps
+4. 抖动大 → 降 lr，加 batch_size
+5. **绝不**第一时间改网络
+
+---
+
+## 本课收获
+
+> PPO 的 clip ratio = '在 1±ε 内自由更新，越界则切平梯度'。是机器人 RL 事实标准 baseline。
+
+## 6.10 思考题
+
+1. 为什么 PPO 要做 importance sampling 修正而 A2C 不用？
+2. clip 的 min 操作起到什么作用？只用 clip 不取 min 行不行？
+3. GAE 的 λ 和 γ 看起来很像，本质区别是什么？
+4. PPO 是 on-policy 还是 off-policy？为什么？
+5. **开放题**：在焊接任务上，n_steps=2048 大约对应物理时间多少秒？这会怎么影响训练效率？
+
+---
+
+下一课：[第 7 课：自定义 Gym 环境](07_custom_gym_env.md)

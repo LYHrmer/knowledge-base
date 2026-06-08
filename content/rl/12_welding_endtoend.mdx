@@ -1,0 +1,252 @@
+---
+title: "第 12 课：焊接端到端实战"
+difficulty: 3
+prereq: []
+---
+# 第 12 课：焊接端到端实战
+**导航**: [← L11 BC + DAgger](11_imitation_learning.md) · [目录](README.md) · [L13 Diffusion ★ →](13_diffusion_policy.md)
+
+> 把前 11 课全部串起来。这一课没有新算法，只有"把 RL 真正用到焊接上"会遇到的所有现实坑。
+> 同时带你写一个完整的 SeamTrackingEnv，从 v1（错的）调到 v2（对的），把"reward 设计的痛苦"实地走一遍。
+
+> **前情提要**: 11 课都是教学例子，这一课把它们全部串到焊接上。亲眼看 reward shaping 怎么从坏 v1 调到对 v2。
+
+---
+
+## 12.1 任务定义：焊缝跟踪
+
+**场景**：一段近似直线的焊缝，机械臂带焊枪沿缝走。
+**输入**：相机图像 + 焊缝偏移估计 + 关节状态
+**输出**：末端 6 维速度增量
+**衡量**：能否走到尾端、偏移多大、抖动多少
+
+简化版：
+
+| 维度 | 设计 |
+|---|---|
+| State (9) | 末端 xyz、末端方向 (3 欧拉)、焊缝相对偏移 (2)、当前进度 (1) |
+| Action (6) | 末端 xyz 速度 + 3 角速度，归一化 [-1, 1] |
+| Episode | 100 步，dt=50ms，覆盖 5 秒 |
+
+---
+
+## 12.2 SeamTrackingEnv v1（坏的）
+
+```python
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+
+class SeamTrackingEnvV1(gym.Env):
+    def __init__(self):
+        super().__init__()
+        self.observation_space = spaces.Box(-10, 10, shape=(9,), dtype=np.float32)
+        self.action_space = spaces.Box(-1, 1, shape=(6,), dtype=np.float32)
+        self.dt = 0.05
+        self.max_steps = 100
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        # 起点偏移焊缝起点 5cm
+        self.ee_pos = np.array([0.0, 0.05, 0.5])
+        self.ee_rot = np.array([0.0, 0.0, 0.0])
+        # 焊缝沿 x 轴
+        self.seam_dir = np.array([1.0, 0.0, 0.0])
+        self.steps = 0
+        return self._obs(), {}
+
+    def _obs(self):
+        # 焊缝偏移：y, z 距理想 0
+        offset = np.array([self.ee_pos[1], self.ee_pos[2] - 0.5])
+        progress = self.ee_pos[0]
+        return np.concatenate([self.ee_pos, self.ee_rot, offset, [progress]]).astype(np.float32)
+
+    def step(self, a):
+        # 直接把 action 当速度，dt 积分
+        self.ee_pos += a[:3] * self.dt
+        self.ee_rot += a[3:] * self.dt
+        offset = np.linalg.norm([self.ee_pos[1], self.ee_pos[2] - 0.5])
+        # ❌ Reward 只关心偏移最小化
+        reward = -offset
+        self.steps += 1
+        terminated = False
+        truncated = self.steps >= self.max_steps
+        return self._obs(), reward, terminated, truncated, {}
+```
+
+PPO 训练 30 万步后，**策略学到的是什么？**
+
+策略输出全 0 速度。看着不偏移（offset=0.05 起步保持），所以 reward 还行。**它学会了停在原地。**
+
+---
+
+## 12.3 调试日志
+
+观察现象：
+- 小车（机械臂）一动不动
+- offset 刚好是初始的 0.05
+- reward = -0.05 × 100 = -5
+
+诊断：reward 没鼓励"前进"。
+进一步：reward 没鼓励"完成"。
+
+---
+
+## 12.4 SeamTrackingEnv v2（修复）
+
+加三个东西：
+1. **进度奖励**：每前进 1cm 给 +1
+2. **完成大奖**：到尾端给 +50
+3. **悬停惩罚**：步数耗尽未到尾端给 -10
+
+```python
+class SeamTrackingEnvV2(SeamTrackingEnvV1):
+    def __init__(self):
+        super().__init__()
+        self.seam_length = 0.5  # 50cm
+        self.last_progress = 0.0
+
+    def reset(self, **kw):
+        obs, info = super().reset(**kw)
+        self.last_progress = self.ee_pos[0]
+        return obs, info
+
+    def step(self, a):
+        obs, _, _, _, info = super().step(a)
+        offset = np.linalg.norm([self.ee_pos[1], self.ee_pos[2] - 0.5])
+        progress = self.ee_pos[0]
+        d_progress = progress - self.last_progress
+        self.last_progress = progress
+
+        # 新 reward
+        r_offset = -offset                # 跟踪精度
+        r_progress = 100 * d_progress      # 前进激励（关键!）
+        r_action = -0.01 * np.sum(a**2)    # 控制代价
+        r_done = 0.0
+        terminated = False
+        if progress >= self.seam_length:
+            r_done = 50.0
+            terminated = True
+        if self.steps >= self.max_steps and not terminated:
+            r_done = -10.0
+        reward = r_offset + r_progress + r_action + r_done
+        return obs, reward, terminated, self.steps >= self.max_steps, info
+```
+
+PPO 再训 30 万步，**策略学会了边走边修正偏移**。
+
+---
+
+## 12.5 Reward shaping 的 6 条原则
+
+1. **稀疏 reward 学得慢但解干净**；稠密 reward 学得快但容易走捷径。**先稀疏 + 进度，再加细节**。
+2. **每个分量加权重**，让你能调节哪个更重要。
+3. **进度奖励是关键**：长任务必须有，否则策略会"摆烂"。
+4. **完成大奖要远大于中间奖**：让策略知道"到达"才是终极目标。
+5. **失败惩罚要有但别太大**：太大让策略学"绕开尝试"，不去探索。
+6. **随时打印 reward 各分量的均值**：训练时看哪个 dominate，及时调权重。
+
+---
+
+## 12.6 Domain Randomization 加进来
+
+```python
+class SeamTrackingEnvV3(SeamTrackingEnvV2):
+    def reset(self, **kw):
+        obs, info = super().reset(**kw)
+        # 焊缝方向 ±5°
+        ang = np.random.uniform(-0.087, 0.087)
+        self.seam_dir = np.array([np.cos(ang), np.sin(ang), 0])
+        # 起点偏移 ±2cm
+        self.ee_pos[1] += np.random.uniform(-0.02, 0.02)
+        # 观测噪声
+        self.obs_noise = np.random.uniform(0, 0.005)
+        return self._obs(), info
+
+    def _obs(self):
+        obs = super()._obs()
+        return obs + np.random.normal(0, self.obs_noise, size=obs.shape).astype(np.float32)
+```
+
+---
+
+## 12.7 ROS2 部署
+
+```python
+# rl_seam_correction.py
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import TwistStamped
+from std_msgs.msg import Float32MultiArray
+import torch
+import numpy as np
+
+class RLSeamCorrectionNode(Node):
+    def __init__(self):
+        super().__init__("rl_seam_correction")
+        self.declare_parameter("model_path", "policy.pt")
+        path = self.get_parameter("model_path").value
+        self.model = torch.jit.load(path)
+        self.model.eval()
+
+        # 假设有 obs 聚合 service / topic
+        self.create_subscription(Float32MultiArray, "/seam_obs", self.cb, 10)
+        self.cmd_pub = self.create_publisher(TwistStamped, "/ee_velocity_cmd", 10)
+
+    def cb(self, msg):
+        obs = np.array(msg.data, dtype=np.float32)
+        if obs.shape != (9,):
+            self.get_logger().warn(f"bad obs shape {obs.shape}")
+            return
+        with torch.no_grad():
+            mean, _ = self.model(torch.from_numpy(obs).unsqueeze(0))
+        action = np.clip(mean.squeeze(0).numpy(), -1, 1)
+
+        cmd = TwistStamped()
+        cmd.header.stamp = self.get_clock().now().to_msg()
+        cmd.twist.linear.x = float(action[0]) * 0.1   # 反归一化到实际单位
+        cmd.twist.linear.y = float(action[1]) * 0.1
+        cmd.twist.linear.z = float(action[2]) * 0.1
+        cmd.twist.angular.x = float(action[3]) * 0.5
+        cmd.twist.angular.y = float(action[4]) * 0.5
+        cmd.twist.angular.z = float(action[5]) * 0.5
+        self.cmd_pub.publish(cmd)
+
+def main():
+    rclpy.init()
+    rclpy.spin(RLSeamCorrectionNode())
+    rclpy.shutdown()
+```
+
+---
+
+## 12.8 真机部署清单
+
+在按 ENTER 跑真机前，这 8 件事都做完：
+
+- [ ] 仿真 reward 曲线稳定上升 200K+ 步
+- [ ] randomization wrapper 关掉，标称参数下能跑通
+- [ ] 用真机的关节状态 / 视觉数据离线 replay 一遍策略，看输出是否合理
+- [ ] 加 action rate limiter（10% 单位时间最大变化量）
+- [ ] e-stop 物理按钮可达
+- [ ] 速度限制到训练速度的 30%
+- [ ] 防撞软件层（碰撞检测）启用
+- [ ] 录像 + 全部 topic 用 rosbag 记录
+
+---
+
+## 本课收获
+
+> Reward shaping 是艺术，**长任务必须有进度奖励**。真机部署照 8 项 checklist 走，省一项就要交学费。
+
+## 12.9 思考题
+
+1. v1 → v2 的关键修复是哪一个？为什么少了它策略会"摆烂"？
+2. r_progress 系数 100 改成 1 会怎样？改成 1000 会怎样？
+3. 如果焊缝是曲线（不是直线），上面 env 还能用吗？要怎么改？
+4. 为什么真机部署速度先限制到 30%？除了安全还有 RL 角度的理由吗？
+5. **开放题**：写一个 1 周计划：从你现在已有的 100 条焊接录像，到上线一个 RL seam tracking。每天的 milestone 是什么？
+
+---
+
+下一课：[第 13 课：Diffusion Policy](13_diffusion_policy.md)

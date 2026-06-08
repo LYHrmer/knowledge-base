@@ -1,1 +1,30 @@
-{ "title": "强化学习", "icon": "🤖", "order": ["00-intro"] }
+{
+  "title": "强化学习",
+  "icon": "🤖",
+  "order": [
+    "00a_what_is_rl",
+    "00b_math_primer",
+    "00_linux_setup",
+    "01_mdp_basics",
+    "02_q_learning_tabular",
+    "03_dqn",
+    "04_reinforce",
+    "05_a2c",
+    "06_ppo",
+    "07_custom_gym_env",
+    "08_domain_rand_ros2",
+    "09_lqr_mpc",
+    "10_sac",
+    "11_imitation_learning",
+    "12_welding_endtoend",
+    "13_diffusion_policy",
+    "14_world_models",
+    "15_vla",
+    "16_rlhf_alignment",
+    "algorithms_at_a_glance",
+    "notation_cheatsheet",
+    "debugging_guide",
+    "sim_comparison",
+    "solutions"
+  ]
+}

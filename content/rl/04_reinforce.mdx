@@ -1,0 +1,198 @@
+---
+title: "第 4 课：REINFORCE（策略梯度起点）"
+difficulty: 2
+prereq: []
+---
+# 第 4 课：REINFORCE（策略梯度起点）
+**导航**: [← L03 DQN](03_dqn.md) · [目录](README.md) · [L05 A2C →](05_a2c.md)
+
+> **前置数学**（看不懂公式时回查）：[00b §3 概率分布](00b_math_primer.md#3-概率分布三个必须会的) · [§4 期望与方差](00b_math_primer.md#4-期望与方差) · [§5 log 与 log 导数技巧](00b_math_primer.md#5-log-与-log-导数技巧最重要的一节) · [§11 期望的梯度（策略梯度定理证明）](00b_math_primer.md#11-期望的梯度策略梯度定理证明)
+
+> DQN 学的是"每个动作多好"（价值），再 argmax 出策略。
+> 这一课换个角度：**直接把策略当神经网络优化**。
+> 这条路通向 A2C / PPO / SAC，是连续控制的主线。
+
+> **前情提要**: L3 学的是'动作好不好'（Q），间接推策略。这一课换思路：**直接把策略做成神经网络**。
+
+---
+
+## 4.1 为什么需要"直接学策略"
+
+### 离散动作 DQN 的局限
+- 焊枪 6 维末端速度，每维离散 100 档 → 1 万亿种动作组合，argmax 算不动。
+- 即使能算，离散化损失精度。
+
+### 直接策略 π(a|s) 的好处
+- 输出**动作的概率分布**，连续离散都能处理
+- 高斯策略：网络输出均值 μ 和标准差 σ，动作 a ~ N(μ, σ)
+- 离散策略：网络输出 logits，softmax 成概率分布
+
+---
+
+## 4.2 策略梯度定理（数学补丁）
+
+**目标**：最大化期望回报 $J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[R(\tau)]$，其中 $\tau$ 是一条轨迹，$R(\tau) = \sum_t \gamma^t r_t$。
+
+**策略梯度定理**（推导跳过，记结论）：
+
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{\tau\sim\pi_\theta}\left[\sum_t \nabla_\theta \log \pi_\theta(a_t \mid s_t) \cdot G_t \right]
+$$
+
+直观：
+- $\log \pi_\theta(a_t|s_t)$ 是"网络给这个动作打了多少分"
+- $G_t$ 是"这个动作之后实际拿到的回报"
+- 乘起来：好回报 → 加大这个动作概率，烂回报 → 减小
+
+**log 导数技巧**：$\nabla_\theta \pi = \pi \cdot \nabla_\theta \log \pi$，让我们只需对 $\log \pi$ 求梯度，PyTorch 自动微分友好。
+
+---
+
+## 4.3 REINFORCE 算法
+
+最朴素的策略梯度算法：
+
+```
+重复:
+  1. 用当前策略 π_θ 跑一整条轨迹 τ = (s_0,a_0,r_0,...,s_T,a_T,r_T)
+  2. 算每步的 G_t = r_t + γ r_{t+1} + ... + γ^{T-t} r_T
+  3. 损失 L = -Σ_t log π(a_t|s_t) · G_t
+  4. 梯度下降一步
+```
+
+注意是**一整条轨迹后才更新**（vs DQN 的每步 mini-batch 更新）。
+
+---
+
+## 4.4 CartPole REINFORCE 完整代码
+
+```python
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.distributions import Categorical
+import numpy as np
+
+class Policy(nn.Module):
+    def __init__(self, obs_dim, n_act):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 128), nn.ReLU(),
+            nn.Linear(128, n_act),
+        )
+    def forward(self, s):
+        return self.net(s)
+
+env = gym.make("CartPole-v1")
+pi = Policy(4, 2)
+opt = optim.Adam(pi.parameters(), lr=1e-2)
+gamma = 0.99
+
+for ep in range(500):
+    s, _ = env.reset()
+    log_probs = []
+    rewards = []
+    done = False
+    while not done:
+        logits = pi(torch.tensor(s, dtype=torch.float32))
+        dist = Categorical(logits=logits)
+        a = dist.sample()
+        log_probs.append(dist.log_prob(a))
+        s, r, term, trunc, _ = env.step(a.item())
+        rewards.append(r)
+        done = term or trunc
+
+    # 算每步的 G_t（从后往前累积）
+    G = 0
+    returns = []
+    for r in reversed(rewards):
+        G = r + gamma * G
+        returns.insert(0, G)
+    returns = torch.tensor(returns, dtype=torch.float32)
+
+    # 标准化（关键技巧，下节讲）
+    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+    # 损失
+    loss = -torch.stack([lp * R for lp, R in zip(log_probs, returns)]).sum()
+
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    if ep % 20 == 0:
+        print(f"ep {ep}, return {sum(rewards):.1f}")
+```
+
+跑 500 episodes 通常能稳定到 200-400。
+
+---
+
+## 4.5 为什么要 returns 标准化（baseline）
+
+直接用 G_t 当权重有问题：**所有 G_t 都是正数时**，每个动作的概率都会被推高（区别只是"推多少"），而不是"好的推、坏的减"。
+
+**减一个 baseline**（比如 returns 均值）后：
+- G_t > mean：这个动作高于平均 → 概率上升
+- G_t < mean：低于平均 → 概率下降
+
+数学上加 baseline 不改变期望梯度（无偏），但能**大幅降低方差**。Lesson 5 的 A2C 把这个 baseline 用神经网络学出来（V 函数），效果更好。
+
+---
+
+## 4.6 高斯策略（连续动作版）
+
+输出均值 μ 和 log 标准差 logσ：
+
+```python
+class GaussianPolicy(nn.Module):
+    def __init__(self, obs_dim, act_dim):
+        super().__init__()
+        self.mu_net = nn.Sequential(
+            nn.Linear(obs_dim, 128), nn.ReLU(),
+            nn.Linear(128, act_dim),
+        )
+        # log_std 设为可学习参数（state-independent）
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+    def forward(self, s):
+        mu = self.mu_net(s)
+        std = self.log_std.exp()
+        return torch.distributions.Normal(mu, std)
+
+# 用法
+dist = pi(s)
+a = dist.sample()
+log_p = dist.log_prob(a).sum(-1)   # 多维独立高斯，log_prob 加起来
+```
+
+为什么学 log_std 不学 std？std 必须 > 0，用 exp 保证。**为什么 log_std 不依赖状态**？工程经验：让它独立反而更稳。
+
+---
+
+## 4.7 REINFORCE 的硬伤
+
+1. **高方差**：单条轨迹估计梯度，噪声极大。
+2. **采样效率低**：一条轨迹只用一次就丢。DQN 用 replay buffer 重复使用。
+3. **不能处理非完整 episode**：必须等终止才算 G_t（或用 truncation 但有偏差）。
+
+下一课 A2C 用 Critic 学 V 函数解决方差问题，再下一课 PPO 解决采样效率问题。
+
+---
+
+## 本课收获
+
+> 策略梯度公式 ∇log π · G_t 的直觉记下来：好回报 → 加大该动作的概率。这是后面 A2C/PPO/SAC 的根。
+
+## 4.8 思考题
+
+1. 为什么策略梯度公式里是 $\log \pi$ 而不是 $\pi$？log 起到了什么作用？
+2. 把 returns 都加 100（或减 100）会怎样？这跟前面"baseline 不变期望"是否矛盾？
+3. 高斯策略的 `log_std` 如果初始化太大（比如 2.0）会怎样？太小（-3.0）呢？
+4. REINFORCE 跑出来的曲线为什么比 DQN 抖很多？
+5. **开放题**：你想让一个 7 自由度机械臂学画一个圆。用 REINFORCE 直接训会有什么问题？至少给两条不会成功的理由。
+
+---
+
+下一课：[第 5 课：A2C](05_a2c.md)

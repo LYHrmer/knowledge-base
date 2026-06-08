@@ -1,0 +1,320 @@
+---
+title: "第 0 课：Linux 零基础实验环境搭建"
+difficulty: 1
+prereq: []
+---
+# 第 0 课：Linux 零基础实验环境搭建
+
+> 假设：你之前用 Windows / macOS，这是第一次系统接触 Linux。
+> 目标：读完这份能从"打开终端"一直走到"跑出第一个 PPO 实验图"。
+
+---
+
+## 0.1 你为什么需要 Linux
+
+短答：**几乎所有机器人 / 深度学习软件栈都假设你跑在 Linux 上**。
+- ROS2、CUDA、PyTorch、Isaac Lab、Gazebo —— 优先支持 Linux
+- 在 Windows 上用 WSL 也能行，但出问题难调
+
+如果你已经有 Ubuntu 22.04 (含 ROS2 Humble 的标配)，**直接跳到 0.4**。
+
+---
+
+## 0.2 装 Ubuntu（已经装好的跳过）
+
+推荐 Ubuntu 22.04 LTS（ROS2 Humble 官方支持版本）。
+
+三种方案：
+1. **物理机双系统**：性能最好，跑 GPU 训练首选。
+2. **WSL2**（Win11）：开发轻松，GPU 通过 NVIDIA WSL 驱动也能用，但 ROS2 + 实机有坑。
+3. **虚拟机**（VirtualBox / VMware）：最简单，但 GPU 不能直通，不适合训 RL。
+
+新手建议双系统或 WSL2，**虚拟机不行**（CartPole 都跑不出 1000FPS）。
+
+装系统教程网上很多，搜 "Ubuntu 22.04 双系统安装" 跟着做即可。
+
+---
+
+## 0.3 终端基本生存
+
+打开终端：`Ctrl + Alt + T`
+
+最小必学命令（一周内会用 100 次以上）：
+
+| 命令 | 作用 | 例子 |
+|---|---|---|
+| `pwd` | 看当前在哪个目录 | `pwd` → `/home/lyh` |
+| `ls` | 看目录里有什么 | `ls -la` 显示全部包括隐藏 |
+| `cd <path>` | 切换目录 | `cd ~/docs` 进入家目录下 docs |
+| `cd ..` | 退到上级 | |
+| `cd ~` | 回家目录 | |
+| `mkdir <name>` | 建目录 | `mkdir rl_practice` |
+| `rm <file>` | 删文件 | `rm bad.txt` |
+| `rm -rf <dir>` | **删目录及一切**（小心！）| `rm -rf old_logs` |
+| `cp <a> <b>` | 复制 | `cp foo.py bar.py` |
+| `mv <a> <b>` | 移动/改名 | `mv old.py new.py` |
+| `cat <file>` | 看文件内容 | `cat README.md` |
+| `nano <file>` | 在终端里编辑 | 退出按 Ctrl+X |
+| `clear` | 清屏 | |
+| `Tab` | 自动补全（救命键）| 输入 `cd ~/do` 按 Tab |
+| `↑ / ↓` | 翻历史命令 | |
+
+**新手最容易踩的坑：**
+- `~` 等于 `/home/你的用户名`
+- 路径有空格要加引号：`cd "my folder"`
+- `rm -rf /` 千万不要敲（会删整个系统，是个梗也是真灾难）
+- 命令的输出复制：选中文字会自动复制，中键粘贴
+
+---
+
+## 0.4 装 conda（管理 Python 环境）
+
+为什么要 conda：不同项目要不同 Python / CUDA 版本，conda 能各开各的环境互不干扰。
+
+```bash
+# 下载 Miniconda（轻量版）
+cd ~
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh
+# 一路回车 + yes，最后让它 init 时选 yes
+# 然后关掉终端再开一个，看到行首有 (base) 就成功了
+```
+
+确认装好：
+
+```bash
+conda --version
+# conda 24.x.x
+```
+
+---
+
+## 0.5 创建 RL 实验环境
+
+```bash
+# 建一个叫 rl 的环境，用 Python 3.10
+conda create -n rl python=3.10 -y
+
+# 激活它
+conda activate rl
+# 行首会从 (base) 变 (rl)
+
+# 装 PyTorch（CPU 版先够用，后面有 GPU 再换）
+pip install torch torchvision
+
+# 装 RL 必备
+pip install gymnasium[classic-control,box2d] pygame
+pip install matplotlib numpy scipy tqdm
+pip install tensorboard
+```
+
+确认能跑：
+
+```bash
+python -c "import gymnasium as gym; env=gym.make('CartPole-v1'); print(env.reset())"
+# 输出类似：(array([...], dtype=float32), {})
+```
+
+看到不报错就成。
+
+---
+
+## 0.6 GPU / CUDA（有 N 卡的话）
+
+先检查你有没有 GPU：
+
+```bash
+nvidia-smi
+```
+
+- 输出表格：有 N 卡，看 Driver Version 和 CUDA Version
+- 输出 `command not found`：没装驱动或不是 N 卡，CPU 也能跑前 12 课
+
+如果有 GPU，装匹配的 PyTorch：
+
+```bash
+# 先卸载 CPU 版
+pip uninstall torch torchvision -y
+
+# 装 CUDA 12.1 版（举例）
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+```
+
+确认 GPU 能用：
+
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# True NVIDIA GeForce RTX 4060
+```
+
+---
+
+## 0.7 装 VSCode（推荐编辑器）
+
+```bash
+# 命令行装
+sudo snap install code --classic
+
+# 或者去 https://code.visualstudio.com/ 下 .deb 双击装
+```
+
+打开后必装插件：
+- Python（微软官方）
+- Pylance
+- Jupyter
+- 中文语言包（可选）
+
+打开项目目录：
+
+```bash
+cd ~/docs/rl-tutorial
+code .
+```
+
+VSCode 选 Python 解释器（左下角 / Ctrl+Shift+P 搜 "Python: Select Interpreter"），选 `~/miniconda3/envs/rl/bin/python`。
+
+---
+
+## 0.8 tmux（长时间训练用）
+
+训 RL 经常一跑就是几小时。如果直接在终端跑，关掉终端就停了。tmux 让进程在后台保持。
+
+```bash
+sudo apt install tmux
+
+# 新建一个 session 叫 train
+tmux new -s train
+
+# 进去后正常跑
+python train_ppo.py
+
+# 不想看了：按 Ctrl+B 然后按 d  → 脱离（detach），训练继续
+# 关掉终端没事
+
+# 想回来看：
+tmux attach -t train
+
+# 列出所有 session
+tmux ls
+
+# 杀掉某 session
+tmux kill-session -t train
+```
+
+最少记三个组合键：
+- `Ctrl+B d`：脱离
+- `Ctrl+B [`：进入翻页模式（看历史输出，q 退出）
+- `Ctrl+B %` / `"`：分屏（左右 / 上下）
+
+---
+
+## 0.9 ssh 远程（用别的机器跑训练时）
+
+家里电脑写代码，远程机器跑训练，是 RL 工程师的标配。
+
+```bash
+# 登远程机
+ssh user@10.0.10.123
+
+# 第一次会问 yes/no，输 yes
+
+# 退出
+exit
+```
+
+**免密登录**（强烈推荐，省事）：
+
+```bash
+# 本地（如果没有就生成）
+ssh-keygen -t ed25519
+# 一路回车，不设密码
+
+# 把公钥送到远程
+ssh-copy-id user@10.0.10.123
+# 输一次密码
+
+# 之后 ssh 就不要密码了
+ssh user@10.0.10.123
+```
+
+**VSCode Remote-SSH 插件**：本地打开远程目录像本地一样写代码，体验飞跃。
+
+**文件传输**：
+
+```bash
+# 本地 → 远程
+scp foo.py user@10.0.10.123:/home/user/
+
+# 远程 → 本地
+scp user@10.0.10.123:/home/user/results.png .
+
+# 整个目录
+scp -r logs/ user@10.0.10.123:/home/user/
+
+# 大文件 / 续传
+rsync -avzP big_dataset.tar user@10.0.10.123:/home/user/
+```
+
+---
+
+## 0.10 第一次跑 RL 代码
+
+测试整套环境：
+
+```bash
+mkdir -p ~/docs/rl-tutorial/code
+cd ~/docs/rl-tutorial/code
+cat > hello_rl.py << 'EOF'
+import gymnasium as gym
+import numpy as np
+
+env = gym.make("CartPole-v1")
+obs, info = env.reset(seed=42)
+total_reward = 0
+for step in range(500):
+    action = env.action_space.sample()  # 随机动作
+    obs, reward, terminated, truncated, info = env.step(action)
+    total_reward += reward
+    if terminated or truncated:
+        print(f"step {step}: reward total = {total_reward}")
+        obs, info = env.reset()
+        total_reward = 0
+env.close()
+EOF
+
+python hello_rl.py
+```
+
+看到一行行 reward 输出（一般 10-50 之间，因为是随机策略），就说明全套环境就绪。
+
+---
+
+## 0.11 常见报错速查
+
+| 报错 | 原因 | 解法 |
+|---|---|---|
+| `ModuleNotFoundError: No module named 'gymnasium'` | 没在 rl 环境里 | `conda activate rl` |
+| `pygame.error: video system not initialized` | 用 ssh 没显示 | `gym.make(..., render_mode=None)` 别 render |
+| `RuntimeError: CUDA out of memory` | GPU 显存爆了 | 减小 batch_size，或 `torch.cuda.empty_cache()` |
+| `nvidia-smi: command not found` | 没装 N 卡驱动 | `sudo ubuntu-drivers autoinstall` 后重启 |
+| `Permission denied` | 文件没权限 | `chmod +x script.sh` 或前面加 `sudo`（小心）|
+| `apt install` 报错 | 没刷源 | `sudo apt update` 再装 |
+| 网卡问题 / 下载慢 | 国内网络 | 配 conda 清华源、pip 清华源（搜"pip 换源 清华"）|
+| 包冲突 | 环境乱了 | 删了重装：`conda env remove -n rl; conda create -n rl ...` |
+
+---
+
+## 0.12 一周熟练度目标
+
+读完这份后给自己一周：
+- 能盲打 `cd / ls / mkdir / rm` 不查文档
+- 能开 tmux session 跑长任务
+- 能用 ssh 登录另一台机器
+- 能在 VSCode 里编辑、运行 Python，看到 print 输出
+- `conda activate rl` 已经成肌肉记忆
+
+到这里，你对 Linux 的恐惧就基本消失了。剩下不会的命令现查现学就行。
+
+---
+
+接下来：[第 1 课：MDP 与 RL 五要素](01_mdp_basics.md)

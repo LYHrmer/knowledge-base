@@ -1,0 +1,199 @@
+---
+title: "算法一页大全"
+difficulty: 1
+prereq: []
+---
+# 算法一页大全
+
+> 学完 16 课回头看，所有算法本质上是几条主线的不同分支。
+> 这一页就是把全景图压缩到一张表 + 一棵决策树。
+
+---
+
+## 一张大表
+
+| 算法 | 课 | on/off-policy | model-free/based | 离散 a | 连续 a | 数据来源 | 样本效率 | 工程难度 | 一句话灵魂 |
+|---|---|---|---|---|---|---|---|---|---|
+| 表格 Q-learning | L2 | off | model-free | ✓ | ✗ | online | 高（小空间）| 极低 | Bellman + ε-greedy |
+| **DQN** | L3 | off | model-free | ✓ | ✗ | online | 中 | 中 | NN 替代表 + Replay + Target Net |
+| Double DQN | L3 | off | model-free | ✓ | ✗ | online | 中 | 中 | 解决 max 算子过估计 |
+| REINFORCE | L4 | on | model-free | ✓ | ✓ | online | 极低 | 低 | 直接 ∇log π · G_t |
+| A2C | L5 | on | model-free | ✓ | ✓ | online | 低 | 低 | 加 critic 降方差 |
+| **PPO** | L6 | 近 on | model-free | ✓ | ✓ | online | 中 | 中 | clip ratio 让数据复用安全 |
+| TRPO | L6 注 | 近 on | model-free | ✓ | ✓ | online | 中 | 高 | PPO 前身，二阶优化 |
+| LQR | L9 | n/a | model-based | ✗ | ✓ | 解析 | n/a | 极低 | 线性二次的解析最优 |
+| MPC | L9 | n/a | model-based | ✗ | ✓ | 解析 | n/a | 中 | 每步重新规划 |
+| DDPG | L10 注 | off | model-free | ✗ | ✓ | online | 高 | 中 | 连续 actor + Q |
+| TD3 | L10 注 | off | model-free | ✗ | ✓ | online | 高 | 中 | DDPG + twin Q + delayed |
+| **SAC** | L10 | off | model-free | ✗ | ✓ | online | 高 | 高 | 最大熵 + twin Q + auto-α |
+| BC | L11 | n/a | n/a | ✓ | ✓ | offline 示教 | 高 | 极低 | 监督学习模仿专家 |
+| DAgger | L11 | n/a | n/a | ✓ | ✓ | online + 专家 | 高 | 中 | BC 在策略状态上扩集 |
+| GAIL | L11 注 | on | model-free | ✓ | ✓ | online + 示教 | 中 | 高 | GAN 风格 + IL |
+| **Diffusion Policy** | L13 | n/a | n/a | ✗ | ✓ | offline 示教 | 中 | 高 | 扩散建模动作分布，多模态友好 |
+| **Dreamer V3** | L14 | off | model-based | ✓ | ✓ | online | 极高 | 极高 | 学 world model 在"梦"里训 |
+| **OpenVLA / π₀** | L15 | n/a | n/a | ✓ | ✓ | offline + 微调 | 中 | 极高 | 大模型继承互联网先验 |
+| RLHF | L16 | 近 on | model-free | ✓ | ✓ | 偏好对 + online | 中 | 高 | 从人偏好学 reward |
+| DPO | L16 | offline | n/a | ✓ | ✓ | 偏好对 | 高 | 中 | 跳过 RM，直接偏好优化 |
+
+★ 加粗的是**面试高频 / 工业落地主流**。
+
+---
+
+## 选型决策树
+
+```
+你的问题 ──── 是 RL 问题吗?
+                │
+                ├─ 不是（监督 / 优化）→ 用 SL / scipy / cvxpy
+                │
+                └─ 是 RL → 看下面
+                
+                能写出动力学方程?
+                ├─ 能且线性 ──→ LQR
+                ├─ 能但非线性 ──→ MPC
+                └─ 不能 / 视觉感知主导 → 看下面
+                
+                有专家示教?
+                ├─ 有，且只想模仿 → BC
+                ├─ 有，单峰任务 → BC + RL fine-tune
+                ├─ 有，多模态任务 → Diffusion Policy
+                ├─ 有，希望大模型先验 → OpenVLA + LoRA
+                └─ 无 / 想从零学 → 看下面
+                
+                能写出 reward function?
+                ├─ 能 → 看下面
+                └─ 不能但有人能比对优劣 → RLHF / DPO
+                
+                动作空间?
+                ├─ 离散小 → DQN / Double DQN
+                ├─ 离散大 / 组合 → PPO（softmax 输出）
+                ├─ 连续 → 看下面
+                
+                重视样本效率（仿真贵 / 真机训练）?
+                ├─ 是 → SAC
+                ├─ 不重要（仿真便宜，并行）→ PPO
+                
+                任务超长 / 需要规划?
+                └─ 考虑 Dreamer / World Model
+```
+
+---
+
+## 算法演化树（一图）
+
+```
+    1989  Q-learning（Watkins）
+       │ 表格 → NN
+       ▼
+    2013  DQN（Mnih）─→ Double DQN ─→ Rainbow
+       
+    1992  REINFORCE（Williams）
+       │ + critic
+       ▼
+    2000s A2C / A3C
+       │ + clip
+       ▼
+    2017  PPO（Schulman）
+                │
+                │ → 离散动作 → DQN 路线
+                │ → 连续 + on-policy → PPO 路线（机器人主流）
+                │ → 连续 + off-policy + max ent
+                ▼
+              SAC（Haarnoja, 2018）
+                
+    2014  DDPG ─→ TD3（2018）─→ SAC（吃下 TD3 的 twin Q）
+                
+    1995  BC（早期）
+       │ 解决分布偏移
+       ▼
+    2011  DAgger（Ross）
+       │ 多模态需求
+       ▼
+    2023  Diffusion Policy（Chi et al.）
+                
+    2018  Ha & Schmidhuber World Models
+       │
+       ▼
+    2020-2024  Dreamer V1/V2/V3
+       
+    2017  RLHF（Christiano）—— 一直冷门
+       │ ChatGPT 出圈
+       ▼
+    2022  RLHF 大爆发
+       │ 简化
+       ▼
+    2023  DPO（Rafailov）
+                
+    2022  RT-1（Google）
+       │ + LLM 主干
+       ▼
+    2023  RT-2 ─→ OpenVLA（2024）─→ π₀（2024）
+```
+
+---
+
+## 各算法一句话灵魂
+
+- **Q-learning**：用 Bellman 方程递归学最优 Q 值
+- **DQN**：把 Q 表换成神经网络 + 用 Replay Buffer + Target Network 让训练稳定
+- **REINFORCE**：直接对策略求梯度，乘以累积回报当权重
+- **A2C**：加 critic 估 V，让 advantage 取代 raw return 降方差
+- **PPO**：clip importance ratio，让一批数据可以多次复用而不崩
+- **LQR**：线性二次问题的解析最优解，一个矩阵搞定
+- **MPC**：每步用模型预测未来 N 步求解最优，rolling 执行
+- **SAC**：在 reward 里加策略熵，鼓励探索 + 用 twin Q 防过估计
+- **BC**：把示教 (s, a) 当监督学习数据
+- **DAgger**：让专家在策略遇到的新状态上继续标注
+- **Diffusion Policy**：用扩散模型生成动作，能拟合任意复杂多模态分布
+- **Dreamer**：学环境模型，让策略在"想象的世界"里训练
+- **VLA**：动作 token 加进 LLM 词表，让 LLM 输出机器人动作
+- **RLHF**：从人选偏好学 reward 模型，再 PPO 优化
+- **DPO**：跳过 reward model，直接从偏好对训策略
+
+---
+
+## 何时用何时不用
+
+### 工业首选
+- 离散 + simple → **DQN**
+- 连续 + sim2real → **PPO + 大量 domain randomization**
+- 连续 + 真机训练（贵）→ **SAC**
+- 有示教 + 短任务 → **BC**（必要时 + RL fine-tune）
+- 有示教 + 多模态 → **Diffusion Policy**
+
+### 不要轻易上手
+- **Dreamer V3**：训练复杂度高，团队需 ML 工程师持续维护
+- **VLA from scratch**：需要 GPU 集群 + 海量数据，初创团队建议直接用 OpenVLA 微调
+- **RLHF**：先确认 reward function 真的写不出来，再做。偏好数据采集贵
+
+### 几乎从不用
+- **REINFORCE**：方差太大，A2C/PPO 已经替代它
+- **TRPO**：被 PPO 全面替代
+- **DDPG**：被 TD3 和 SAC 替代
+- **GAIL**：训练不稳定，被 BC + RL 或 RLHF 替代
+
+---
+
+## "我不懂数学，先掌握哪几个就够"
+
+如果只能选 3 个深啃：
+1. **PPO**（机器人 RL 事实标准）
+2. **BC**（最简单实用基线）
+3. **SAC**（连续控制 SOTA）
+
+这三个吃透，你能解决 80% 的实际问题。
+
+如果再加 2 个看趋势：
+4. **Diffusion Policy**（2023+ 模仿学习新范式）
+5. **OpenVLA**（2024+ 通用机器人方向）
+
+---
+
+## 配套查表
+
+公式不懂？→ [00b_math_primer.md](00b_math_primer.md)
+符号不懂？→ [notation_cheatsheet.md](notation_cheatsheet.md)
+训练崩了？→ [debugging_guide.md](debugging_guide.md)
+仿真选哪个？→ [sim_comparison.md](sim_comparison.md)
+
+回 [README](README.md)。

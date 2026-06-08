@@ -1,0 +1,201 @@
+---
+title: "第 11 课：BC + DAgger（模仿学习）"
+difficulty: 2
+prereq: []
+---
+# 第 11 课：BC + DAgger（模仿学习）
+**导航**: [← L10 SAC](10_sac.md) · [目录](README.md) · [L12 焊接实战 →](12_welding_endtoend.md)
+
+> 之前 10 课都是"试错学习"。这一课换个完全不同的范式：**给我专家示教，我直接学**。
+> 模仿学习（Imitation Learning, IL）是机器人落地最实用的方法之一——你已经有大量人示教焊接录像，扔进去训练就能用。
+
+> **前情提要**: 之前都在'试错学习'。这一课换范式：**给我专家示教，我直接学**。
+
+---
+
+## 11.1 BC（Behavior Cloning）：最朴素
+
+把"示教数据"当监督学习处理：
+- 输入 = 状态 / 观测
+- 输出 = 专家做的动作
+- 损失 = MSE（连续动作）/ Cross-Entropy（离散）
+
+```python
+# 极简 BC
+import torch
+import torch.nn as nn
+
+class BCPolicy(nn.Module):
+    def __init__(self, obs_dim, act_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, act_dim),
+        )
+    def forward(self, s):
+        return self.net(s)
+
+# 数据：N 条 (s, a) 对
+dataset = ...  # torch.utils.data.Dataset
+loader = torch.utils.data.DataLoader(dataset, batch_size=256, shuffle=True)
+
+policy = BCPolicy(obs_dim, act_dim)
+opt = torch.optim.Adam(policy.parameters(), lr=1e-3)
+
+for epoch in range(50):
+    for s, a in loader:
+        pred = policy(s)
+        loss = nn.functional.mse_loss(pred, a)
+        opt.zero_grad(); loss.backward(); opt.step()
+```
+
+简单到离谱。这就是 BC。
+
+---
+
+## 11.2 BC 的硬伤：Compounding Error（误差累积）
+
+BC 在训练分布上表现完美，**但部署时一旦偏离专家轨迹，就会越偏越远**：
+
+```
+专家轨迹:    s0 ─→ s1 ─→ s2 ─→ ... 
+BC 部署:    s0 ─→ s1' (略偏) ─→ s2' (更偏，因为 s1' 不在训练集) ─→ s3'' (跑飞了)
+```
+
+数学描述：误差按时间步的二次方增长（Ross & Bagnell 2010）。
+
+直观理解：
+- 监督学习假设训练 / 测试分布相同
+- BC 训完后，**部署的状态分布是策略自己生成的**，和专家分布不一样
+- 没见过 → 乱做 → 更没见过 → 更乱做
+
+---
+
+## 11.3 DAgger（Dataset Aggregation）
+
+Ross & Bagnell（2011）的解法：让专家**在策略遇到的状态上**给标签。
+
+```
+Algorithm DAgger:
+1. 用专家数据 D 训出 π_1 (BC)
+2. 用 π_i 跑环境，收集策略遇到的状态序列 S_i
+3. 找专家给 S_i 中每个 s 标 a*
+4. D ← D ∪ {(s, a*)}
+5. 在 D 上重训 π_{i+1}
+6. 回到 2，循环 N 次
+```
+
+效果：策略状态分布**逐渐覆盖**到专家不会遇到的"修复区域"，知道偏离时怎么找回。
+
+代码骨架：
+
+```python
+def dagger(env, expert_fn, n_iters=10, episodes_per_iter=20):
+    D = collect_expert_demos(expert_fn, n=100)
+    policy = train_bc(D, epochs=50)
+
+    for it in range(n_iters):
+        # 用当前 policy 跑 env，记录遇到的状态
+        new_states = []
+        for _ in range(episodes_per_iter):
+            s, _ = env.reset()
+            done = False
+            while not done:
+                a = policy(s)
+                new_states.append(s)
+                s, _, term, trunc, _ = env.step(a)
+                done = term or trunc
+
+        # 找专家标签
+        new_labels = [expert_fn(s) for s in new_states]
+        D += list(zip(new_states, new_labels))
+
+        # 重训
+        policy = train_bc(D, epochs=50)
+    return policy
+```
+
+---
+
+## 11.4 IL + RL 混合（实战常用）
+
+DAgger 的痛点：**专家必须 on-call**。真焊工没法 24h 守着等你打标。
+
+混合方案：
+1. 用 BC 先 warm-start 一个还行的策略
+2. 加 RL 微调（PPO / SAC，reward 是任务的真实 reward）
+3. 加 KL 约束防止偏离 BC 太远（防灾难性）
+
+这是**学术界主流路线**，叫 BC initialization + RL fine-tuning。
+
+```python
+# 伪代码
+policy = train_bc(expert_data)        # Stage 1
+policy = ppo_finetune(policy,         # Stage 2
+                     env,
+                     kl_to_bc=0.01)   # 别离 BC 太远
+```
+
+---
+
+## 11.5 IRL / GAIL（高级路线）
+
+如果你**只有专家轨迹，没有 reward 函数**，怎么办？
+
+- **IRL（Inverse RL）**：从专家轨迹反推他在优化什么 reward，然后用 RL 优化
+- **GAIL（Generative Adversarial IL）**：D 区分专家 vs 策略轨迹，G(=策略)学着骗 D，D 输出当 reward
+
+GAIL 在 mujoco 经典任务上很成功，但训练不稳（GAN 通病）。
+
+近年（2023+）IRL 路线被 RLHF（Lesson 16）取代——偏好数据更易采集。
+
+---
+
+## 11.6 常见数据问题
+
+### 问题 1：状态-动作分布偏差
+人示教时手法柔和，BC 学到"柔和动作"，遇到突发状况不会激烈反应。
+**解法**：示教时刻意制造一些"扰动 → 修复"的样本。
+
+### 问题 2：观测不完整
+人能看到的（视觉、力觉）和机器人传感器不一样。
+**解法**：教学示教时**记录机器人传感器视角**，不要让人额外用眼。
+
+### 问题 3：多模态动作
+"看到红色物体 → 抓 / 推 / 绕开"都合理，BC 学高斯均值会变成"中间动作"全错。
+**解法**：见 Lesson 13 Diffusion Policy。
+
+---
+
+## 11.7 应用到焊接
+
+你已有的：
+- N 条人焊接的录像（图像 + 关节角时序）
+- 没有 reward 函数（焊缝好不好难形式化）
+
+最实用路线：
+1. **数据预处理**：从录像提取 (image, joint_pos, joint_vel) 时序，算每步的"动作"（关节速度差）
+2. **BC**：训一个 ResNet+MLP，input=image+joint_state，output=joint_velocity
+3. **小规模真机微调**：用低速度跑几次，看哪些状态偏离训练分布，**人工示教**那些场景补到数据集
+4. **(可选) RLHF**：见 Lesson 16
+
+500-2000 条示教对垂直焊接任务是足够的起点。
+
+---
+
+## 本课收获
+
+> BC 简单但有 compounding error 病；DAgger / BC + RL fine-tune 是常用解药。100 条示教 + BC 是落地最实用的起点。
+
+## 11.8 思考题
+
+1. 为什么 BC 在 supervised learning 看起来无懈可击，部署时却容易跑飞？画一个状态分布的图说明。
+2. DAgger 需要 on-call 专家。如果用一个 MPC 控制器（Lesson 9）当"专家"，可不可以？
+3. BC 的损失为什么用 MSE 而不是更复杂的？什么时候 MSE 不够？
+4. 如果专家本身不完美（人焊得也有差的），BC 会学到什么？
+5. **开放题**：你有 100 条焊接示教，是该 BC + RL 微调，还是直接 PPO 从零训？给四个判断维度。
+
+---
+
+下一课：[第 12 课：焊接端到端实战](12_welding_endtoend.md)

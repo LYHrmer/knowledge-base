@@ -1,0 +1,218 @@
+---
+title: "第 7 课：自定义 Gym 环境"
+difficulty: 2
+prereq: []
+---
+# 第 7 课：自定义 Gym 环境
+**导航**: [← L06 PPO](06_ppo.md) · [目录](README.md) · [L08 DR + ROS2 →](08_domain_rand_ros2.md)
+
+> 前 6 课你都在用 CartPole / Pendulum 这种官方环境。
+> 真正落地，必须**自己写 env**——把你的物理 / 仿真 / 任务包装成 RL 算法能调用的接口。
+
+> **前情提要**: 前 6 课都用官方 CartPole / Pendulum。这一课开始把'自己的问题'包装成 RL 算法能用的 env。
+
+---
+
+## 7.1 Gymnasium Env 接口
+
+`gymnasium.Env` 是约定。你只要实现 5 个方法，所有 PPO/SAC/DQN 实现都能直接用：
+
+```python
+class MyEnv(gymnasium.Env):
+    def __init__(self, ...):     # 定义 observation_space 和 action_space
+    def reset(self, seed=None):  # 返回 (obs, info)
+    def step(self, action):      # 返回 (obs, reward, terminated, truncated, info)
+    def render(self):            # 可视化（可选）
+    def close(self):             # 清理资源
+```
+
+两个空间用 `gymnasium.spaces`：
+- `Box(low, high, shape, dtype)`：连续区间
+- `Discrete(n)`：离散
+- `Dict({"image": Box(...), "state": Box(...)})`：组合
+
+---
+
+## 7.2 完整例子：两连杆机械臂到达任务
+
+```python
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+
+class TwoLinkReachEnv(gym.Env):
+    """
+    平面两连杆机械臂，末端要到达目标点。
+    状态: [θ1, θ2, θ̇1, θ̇2, target_x, target_y]  (6 维)
+    动作: [τ1, τ2]  关节力矩 (2 维)
+    """
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(self, render_mode=None):
+        super().__init__()
+        # 物理参数
+        self.l1 = 1.0
+        self.l2 = 1.0
+        self.dt = 0.05
+        self.max_torque = 2.0
+        self.max_steps = 200
+
+        # 空间
+        high_obs = np.array([np.pi, np.pi, 8.0, 8.0, 2.0, 2.0])
+        self.observation_space = spaces.Box(-high_obs, high_obs, dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=-self.max_torque, high=self.max_torque,
+            shape=(2,), dtype=np.float32
+        )
+
+        self.render_mode = render_mode
+        self.reset()
+
+    def _get_obs(self):
+        return np.array([
+            self.theta1, self.theta2, self.dtheta1, self.dtheta2,
+            self.target[0], self.target[1]
+        ], dtype=np.float32)
+
+    def _ee_pos(self):
+        x = self.l1*np.cos(self.theta1) + self.l2*np.cos(self.theta1 + self.theta2)
+        y = self.l1*np.sin(self.theta1) + self.l2*np.sin(self.theta1 + self.theta2)
+        return np.array([x, y])
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.theta1 = self.np_random.uniform(-np.pi, np.pi)
+        self.theta2 = self.np_random.uniform(-np.pi, np.pi)
+        self.dtheta1 = 0.0
+        self.dtheta2 = 0.0
+        # 目标在工作空间内随机
+        r = self.np_random.uniform(0.5, 1.8)
+        ang = self.np_random.uniform(0, 2*np.pi)
+        self.target = np.array([r*np.cos(ang), r*np.sin(ang)])
+        self.steps = 0
+        return self._get_obs(), {}
+
+    def step(self, action):
+        a = np.clip(action, -self.max_torque, self.max_torque)
+        # 简化动力学：力矩直接控加速度
+        self.dtheta1 += a[0] * self.dt
+        self.dtheta2 += a[1] * self.dt
+        self.dtheta1 = np.clip(self.dtheta1, -8, 8)
+        self.dtheta2 = np.clip(self.dtheta2, -8, 8)
+        self.theta1 += self.dtheta1 * self.dt
+        self.theta2 += self.dtheta2 * self.dt
+        self.theta1 = (self.theta1 + np.pi) % (2*np.pi) - np.pi
+        self.theta2 = (self.theta2 + np.pi) % (2*np.pi) - np.pi
+
+        # Reward
+        ee = self._ee_pos()
+        dist = np.linalg.norm(ee - self.target)
+        reward = -dist - 0.01*np.sum(a**2)   # 距离 + 控制代价
+
+        self.steps += 1
+        terminated = bool(dist < 0.1)         # 到达
+        if terminated:
+            reward += 10.0
+        truncated = bool(self.steps >= self.max_steps)
+
+        return self._get_obs(), reward, terminated, truncated, {"dist": dist}
+
+    def render(self):
+        if self.render_mode != "human":
+            return
+        # 用 matplotlib 简单画
+        import matplotlib.pyplot as plt
+        plt.clf()
+        x1 = self.l1*np.cos(self.theta1)
+        y1 = self.l1*np.sin(self.theta1)
+        x2 = x1 + self.l2*np.cos(self.theta1 + self.theta2)
+        y2 = y1 + self.l2*np.sin(self.theta1 + self.theta2)
+        plt.plot([0, x1, x2], [0, y1, y2], "b-o")
+        plt.plot(*self.target, "rx", markersize=12)
+        plt.xlim(-2.5, 2.5); plt.ylim(-2.5, 2.5)
+        plt.gca().set_aspect("equal")
+        plt.pause(0.01)
+```
+
+注册让 `gym.make` 能找到（可选）：
+
+```python
+gym.register(
+    id="TwoLinkReach-v0",
+    entry_point="my_envs:TwoLinkReachEnv",
+    max_episode_steps=200,
+)
+```
+
+---
+
+## 7.3 写 Env 的 6 条经验
+
+### 1. observation 的"坐标系"很重要
+角度会跨 -π/π 跳变，神经网络很难学。**几乎所有论文用 `[sin θ, cos θ]` 替换 θ**。
+
+```python
+# 不要这样
+obs = np.array([theta, dtheta])
+# 应该这样
+obs = np.array([np.sin(theta), np.cos(theta), dtheta])
+```
+
+### 2. action 用归一化空间
+Box(-1, 1) 的连续动作最稳定。物理量在 step() 里再缩放。
+
+### 3. reward shaping 是艺术
+- 稀疏 reward（只到达时给）：好学但慢
+- 稠密 reward（每步距离）：快但容易走捷径
+- 平衡：稠密引导 + 完成奖励大头
+
+### 4. terminated vs truncated 分开
+- `terminated`：任务完成 / 失败（done by env logic）
+- `truncated`：时间到了 / 步数上限（done by time）
+
+PPO/SAC 训练计算 V(s_next) 时，truncated 时仍然要算（不是终止状态），terminated 时不算。
+
+### 5. info 字典放调试信息
+不参与训练，但 wandb / tensorboard 可以画：
+
+```python
+info = {"dist": dist, "torque_used": np.sum(a**2)}
+```
+
+### 6. seed 一定要 super().reset(seed=seed)
+否则同样种子结果不一样，无法复现。
+
+---
+
+## 7.4 用 PPO 训这个 env
+
+```python
+import gymnasium as gym
+from stable_baselines3 import PPO
+gym.register(id="TwoLinkReach-v0", entry_point="my_envs:TwoLinkReachEnv")
+
+env = gym.make("TwoLinkReach-v0")
+model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4, n_steps=2048)
+model.learn(total_timesteps=200_000)
+model.save("two_link_ppo")
+```
+
+stable-baselines3 是工业级 PPO 实现，用它快速验证 env 正确性比手写靠谱。
+
+---
+
+## 本课收获
+
+> 写 Gym env 的 6 条经验（sin/cos 替 θ、action 归一化、terminated vs truncated）是落地基本功。
+
+## 7.5 思考题
+
+1. 为什么 observation 要用 sin/cos 而不是直接 θ？画一下 θ 在 -π/π 附近的"跳变"，体会神经网络看到这个会怎样。
+2. 如果 reward 只在到达时给 +10、其他时刻 0，PPO 还能学到吗？需要什么辅助手段？
+3. terminated 和 truncated 在 GAE 计算里区别是什么？联系 Lesson 6。
+4. action 不归一化（直接输出力矩）会怎样？你预期 PPO 训练曲线变成什么样？
+5. **开放题**：把 SeamTracking 任务建成 env，至少给出 obs/action/reward 的 3 个不同版本设计，比较各自优缺点。
+
+---
+
+下一课：[第 8 课：Domain Randomization + ROS2 部署](08_domain_rand_ros2.md)

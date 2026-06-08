@@ -1,0 +1,213 @@
+---
+title: "第 8 课：Domain Randomization + ROS2 部署"
+difficulty: 2
+prereq: []
+---
+# 第 8 课：Domain Randomization + ROS2 部署
+**导航**: [← L07 自定义 Env](07_custom_gym_env.md) · [目录](README.md) · [L09 LQR / MPC →](09_lqr_mpc.md)
+
+> 仿真里训得 99% 成功，部署到真机直接 0%。这是 RL 落地最大杀手 —— **sim-to-real gap**。
+> 这一课讲两个工具：训练时**领域随机化**让策略对差异不敏感；部署时把 PyTorch 模型塞进 ROS2 节点。
+
+> **前情提要**: 仿真训出来的策略真机直接崩。这一课讲两个工具让 sim → real：训练时 randomization、部署时 ROS2 节点化。
+
+---
+
+## 8.1 为什么 sim 和 real 不一样
+
+差异来源：
+- **物理参数误差**：质量、摩擦、关节阻尼，仿真不可能 100% 对
+- **执行延迟**：真机控制周期、通讯延迟
+- **传感噪声**：相机噪声、编码器抖动
+- **未建模物理**：电磁干扰、机械形变、温漂
+
+策略只在精确仿真上训练，等于过拟合到一个特定参数集，换个就崩。
+
+---
+
+## 8.2 Domain Randomization 思想
+
+训练时**每个 episode 随机扰动一些参数**，策略被迫学一种"对参数变化鲁棒"的解法。这种解法迁移到真机就能用。
+
+数学上等价于在参数空间分布 p(ξ) 上求平均最优策略：
+$$
+\pi^* = \arg\max_\pi \mathbb{E}_{\xi \sim p(\xi)}\left[J(\pi; \xi)\right]
+$$
+
+OpenAI Dactyl（2019）用这招训出真机灵巧操作魔方，是这个方向的经典里程碑。
+
+---
+
+## 8.3 Wrapper 实现
+
+最干净的做法是写一个 wrapper，每次 reset 改物理参数：
+
+```python
+import gymnasium as gym
+import numpy as np
+
+class DomainRandWrapper(gym.Wrapper):
+    """
+    每次 reset 随机化:
+      - 连杆质量 ±20%
+      - 摩擦系数 ±50%
+      - 观测加高斯噪声
+      - 动作加延迟 (0~3 步)
+    """
+    def __init__(self, env, randomize=True):
+        super().__init__(env)
+        self.randomize = randomize
+        self.action_history = []
+
+    def reset(self, **kwargs):
+        if self.randomize:
+            # 这些假设 env 暴露了对应属性
+            self.env.l1 = 1.0 * np.random.uniform(0.9, 1.1)
+            self.env.l2 = 1.0 * np.random.uniform(0.9, 1.1)
+            self.obs_noise = np.random.uniform(0.0, 0.05)
+            self.action_delay = np.random.randint(0, 3)
+            self.action_history = []
+        obs, info = self.env.reset(**kwargs)
+        return self._add_noise(obs), info
+
+    def step(self, action):
+        # 动作延迟模拟
+        self.action_history.append(action)
+        if len(self.action_history) > self.action_delay:
+            real_action = self.action_history[-self.action_delay-1]
+        else:
+            real_action = self.action_history[0]
+        obs, r, term, trunc, info = self.env.step(real_action)
+        return self._add_noise(obs), r, term, trunc, info
+
+    def _add_noise(self, obs):
+        return obs + np.random.normal(0, self.obs_noise, size=obs.shape).astype(obs.dtype)
+```
+
+用法：
+
+```python
+env = TwoLinkReachEnv()
+env = DomainRandWrapper(env, randomize=True)
+model = PPO("MlpPolicy", env, ...).learn(500_000)
+```
+
+测试时关掉 `randomize=False` 看在标称参数下的表现。
+
+---
+
+## 8.4 几种典型随机化范围
+
+| 维度 | 范围 | 备注 |
+|---|---|---|
+| 质量 | ±20% | 太大会无解 |
+| 摩擦 / 阻尼 | ±50% | 不易测准 |
+| 控制延迟 | 0-50ms | 真机一定有 |
+| 观测噪声 | σ=1-5% | 高斯 |
+| 控制频率扰动 | ±10% | 周期不固定 |
+| 重力 | ±5% | 不同地区有差 |
+| 视觉光照 / 纹理 | 全随机 | 视觉策略必备 |
+
+太大策略学不到东西，太小起不到作用。**逐渐扩大**（curriculum）效果最好。
+
+---
+
+## 8.5 ROS2 部署：把策略变成节点
+
+训好的模型导出成 TorchScript 或 ONNX：
+
+```python
+# 训练后导出 TorchScript
+import torch
+model = ...  # 你的 ActorCritic
+model.eval()
+example = torch.zeros(1, 6)  # 一个 dummy obs
+traced = torch.jit.trace(model, example)
+traced.save("policy.pt")
+```
+
+ROS2 节点：
+
+```python
+# rl_policy_node.py
+import rclpy
+from rclpy.node import Node
+import torch, numpy as np
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray
+
+class PolicyNode(Node):
+    def __init__(self):
+        super().__init__("rl_policy")
+        self.declare_parameter("model_path", "policy.pt")
+        path = self.get_parameter("model_path").value
+
+        self.model = torch.jit.load(path)
+        self.model.eval()
+
+        self.last_target = np.array([1.0, 0.5])  # 从 service 拿
+        self.create_subscription(JointState, "/joint_states", self.cb, 10)
+        self.cmd_pub = self.create_publisher(Float64MultiArray, "/torque_cmd", 10)
+
+    def cb(self, msg: JointState):
+        obs = np.array([
+            msg.position[0], msg.position[1],
+            msg.velocity[0], msg.velocity[1],
+            self.last_target[0], self.last_target[1],
+        ], dtype=np.float32)
+
+        with torch.no_grad():
+            logits, _ = self.model(torch.from_numpy(obs).unsqueeze(0))
+        # 假设是 deterministic（输出均值）
+        action = logits.squeeze(0).numpy()
+        action = np.clip(action, -2.0, 2.0)
+
+        cmd = Float64MultiArray()
+        cmd.data = action.tolist()
+        self.cmd_pub.publish(cmd)
+
+def main():
+    rclpy.init()
+    rclpy.spin(PolicyNode())
+    rclpy.shutdown()
+```
+
+---
+
+## 8.6 工程关键点
+
+1. **观测顺序必须和训练一致**：写注释 + 单元测试，否则部署直接崩。
+2. **频率匹配**：训练 50Hz 就部署 50Hz，差太多策略表现下降。
+3. **观测预处理 wrapper 也要带过去**：归一化、噪声 wrapper 在训练时叠了，部署时也要做（除噪声）。
+4. **动作 clip + 渐变**：突然给大力矩可能损伤机械，加一个 rate limiter。
+5. **失败兜底**：策略输出 NaN / Inf 立即切到默认安全状态。
+
+---
+
+## 8.7 渐进部署策略
+
+1. **仿真 → 仿真 + 噪声**（验证 wrapper）
+2. **重力补偿模式**（机械臂浮空，不接负载）
+3. **低速度限制**（最大速度的 30%）跑真机
+4. **正常速度但备用 e-stop**
+5. **完全自主**
+
+每一步都要回头看：**仿真到这步的 reward 曲线和真机表现 gap 多大？** Gap 大就回去补 randomization。
+
+---
+
+## 本课收获
+
+> Domain Randomization 等价于'参数空间的数据增强'。部署时观测顺序错了是看不见的杀手 bug。
+
+## 8.8 思考题
+
+1. 为什么 Domain Randomization 能 work？给一个 RL 之外的类比（提示：考虑数据增强）。
+2. 如果某个参数无法仿真（比如焊枪电弧的随机扰动），怎么办？
+3. 部署时观测顺序错了，可能产生什么"看起来像 bug 实际是数据流"的怪现象？
+4. ROS2 用 TorchScript 还是 ONNX + TensorRT？分别什么场景？
+5. **开放题**：你想训一个能在不同型号机械臂（5kg / 10kg / 20kg 负载）上都能用的策略，怎么设计 randomization？
+
+---
+
+下一课：[第 9 课：LQR / MPC](09_lqr_mpc.md)

@@ -12,9 +12,9 @@ describe("listSubjects", () => {
 
 describe("getLesson", () => {
   it("返回课文正文与 frontmatter", () => {
-    const lesson = getLesson("rl", "00-intro");
-    expect(lesson.title).toBe("什么是强化学习");
+    const lesson = getLesson("rl", "01_mdp_basics");
+    expect(lesson.title).toBe("第 1 课：MDP 与 RL 五要素");
     expect(lesson.difficulty).toBe(1);
-    expect(lesson.content).toContain("强化学习");
+    expect(lesson.content).toContain("MDP");
   });
 });

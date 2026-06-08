@@ -1,0 +1,270 @@
+---
+title: "第 13 课：Diffusion Policy ★难"
+difficulty: 3
+prereq: []
+---
+# 第 13 课：Diffusion Policy ★难
+**导航**: [← L12 焊接实战](12_welding_endtoend.md) · [目录](README.md) · [L14 World Model →](14_world_models.md)
+
+> **前置数学**：[00b §3 高斯分布](00b_math_primer.md#33-gaussian正态分布) · [§9 重参数化](00b_math_primer.md#9-重参数化技巧) · 链式法则求多步迭代时的雅可比
+
+> BC 学不到多模态动作（一个状态有多种合理动作）。
+> Diffusion Policy 用扩散模型生成动作分布，2023 年来已成为机器人模仿学习的事实标准。
+> 这一课从"为什么 Gaussian BC 会失败"讲起，到完整的 Diffusion Policy 实现。
+
+> **前情提要**: BC 假设单峰高斯，对多模态动作（绕左还是绕右都行）失效。这一课讲 2023+ 模仿学习的新事实标准。
+
+---
+
+## 13.1 BC 多模态失败：玩具例子
+
+考虑一个 1D 任务：状态 s = 0，专家有两种合理动作 a = -1 或 a = +1（比如绕过障碍物，左右都行）。
+
+数据：50% (s=0, a=-1)，50% (s=0, a=1)。
+
+BC 用高斯策略学到的均值：μ ≈ 0（两个 mode 中间）。
+**这是最差的动作！** 直接撞障碍物。
+
+```
+专家分布：     a=-1                     a=+1
+              ████                      ████
+              ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░
+                        ▲
+                        │
+                    BC学的高斯
+                        ▼
+                    最坏动作！
+```
+
+**Gaussian 假设了单峰分布**，多模态彻底失效。
+
+---
+
+## 13.2 Diffusion 的核心思想
+
+不假设动作分布是高斯。**直接学怎么从噪声 sample 出动作**。
+
+### Forward process（加噪，已知）
+
+从干净动作 $a_0$ 一步步加高斯噪声，T 步后变纯噪声 $a_T$：
+
+$$
+a_t = \sqrt{\bar\alpha_t}\, a_0 + \sqrt{1 - \bar\alpha_t}\, \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)
+$$
+
+这一步**不需要训练**，是给定的扩散过程。
+
+### Reverse process（去噪，要学）
+
+训一个网络 $\epsilon_\theta(a_t, t, s)$ 来预测加进去的噪声 $\epsilon$。
+
+训练目标：
+$$
+\mathcal{L} = \mathbb{E}_{t, a_0, \epsilon}\left[\|\epsilon - \epsilon_\theta(a_t, t, s)\|^2\right]
+$$
+
+这就是个**简单的回归 loss**！
+
+### 推理（生成动作）
+
+从纯噪声 $a_T \sim \mathcal{N}(0, I)$ 开始，反向迭代去噪：
+
+$$
+a_{t-1} = \frac{1}{\sqrt{\alpha_t}}\left(a_t - \frac{1-\alpha_t}{\sqrt{1-\bar\alpha_t}} \epsilon_\theta(a_t, t, s)\right) + \sigma_t z, \quad z \sim \mathcal{N}(0, I)
+$$
+
+迭代 T 次（一般 50-100 步），得到最终动作 $a_0$。
+
+**关键**：这种生成过程能产生任意复杂的多模态分布，不像高斯只能拟合一个峰。
+
+---
+
+## 13.3 50 行 Demo：Gaussian BC vs Diffusion
+
+```python
+import torch
+import torch.nn as nn
+import numpy as np
+
+# 多模态数据
+N = 1000
+data = np.concatenate([np.full(N//2, -1.0), np.full(N//2, 1.0)])
+data = data + np.random.randn(N) * 0.05  # 小噪声
+data = torch.tensor(data, dtype=torch.float32).unsqueeze(-1)
+
+# === Method 1: Gaussian BC ===
+class GBC(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.mu = nn.Parameter(torch.zeros(1))
+        self.log_sigma = nn.Parameter(torch.zeros(1))
+    def forward(self):
+        return torch.distributions.Normal(self.mu, self.log_sigma.exp())
+
+gbc = GBC()
+opt = torch.optim.Adam(gbc.parameters(), lr=1e-2)
+for _ in range(2000):
+    loss = -gbc().log_prob(data).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+print("Gaussian mean:", gbc.mu.item(), "std:", gbc.log_sigma.exp().item())
+samples_g = gbc().sample((1000,)).numpy()
+
+# === Method 2: Diffusion ===
+T = 50
+betas = torch.linspace(1e-4, 0.02, T)
+alphas = 1 - betas
+alpha_bars = torch.cumprod(alphas, 0)
+
+class Eps(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 128), nn.SiLU(),
+            nn.Linear(128, 128), nn.SiLU(),
+            nn.Linear(128, 1),
+        )
+    def forward(self, a, t):
+        # t 嵌入：归一化到 [0,1]
+        t_emb = (t.float() / T).unsqueeze(-1)
+        return self.net(torch.cat([a, t_emb], -1))
+
+eps_net = Eps()
+opt2 = torch.optim.Adam(eps_net.parameters(), lr=1e-3)
+for _ in range(5000):
+    idx = torch.randint(0, N, (256,))
+    a0 = data[idx]
+    t = torch.randint(0, T, (256,))
+    noise = torch.randn_like(a0)
+    ab = alpha_bars[t].unsqueeze(-1)
+    a_t = ab.sqrt() * a0 + (1 - ab).sqrt() * noise
+    pred = eps_net(a_t, t)
+    loss = (pred - noise).pow(2).mean()
+    opt2.zero_grad(); loss.backward(); opt2.step()
+
+# 生成
+def sample_diff():
+    a = torch.randn(1000, 1)
+    for t in reversed(range(T)):
+        ab = alpha_bars[t]
+        ab_prev = alpha_bars[t-1] if t > 0 else torch.tensor(1.0)
+        beta = betas[t]
+        eps = eps_net(a, torch.full((1000,), t))
+        a = (a - (1-alphas[t])/(1-ab).sqrt() * eps) / alphas[t].sqrt()
+        if t > 0:
+            a = a + beta.sqrt() * torch.randn_like(a)
+    return a.numpy()
+
+samples_d = sample_diff()
+print("Gaussian samples histogram:", np.histogram(samples_g, bins=10))
+print("Diffusion samples histogram:", np.histogram(samples_d, bins=10))
+```
+
+GBC 输出在 0 附近一片，Diffusion 输出双峰在 -1 和 1。
+
+---
+
+## 13.4 真实 Diffusion Policy 架构（CoRL 2023）
+
+实战上还需要：
+
+1. **状态作为条件**：网络输入 (a_t, t, state)，state 通常先用 ResNet 提特征
+2. **Action Chunk**：一次生成未来 H 步动作（H=8-16），不是单步
+3. **U-Net 或 Transformer 主干**：动作维度高时
+
+简化结构：
+
+```python
+class DiffusionPolicy(nn.Module):
+    def __init__(self, obs_dim, act_dim, horizon=16):
+        super().__init__()
+        self.horizon = horizon
+        self.obs_encoder = nn.Sequential(
+            nn.Linear(obs_dim, 256), nn.SiLU(),
+            nn.Linear(256, 256), nn.SiLU(),
+        )
+        # 1D U-Net over action sequence (act_dim, horizon)
+        self.unet = ActionUNet1D(act_dim, cond_dim=256+128)  # +128 for time embed
+
+    def forward(self, a_seq, t, obs):
+        cond = self.obs_encoder(obs)
+        t_emb = sinusoidal_time_embed(t, dim=128)
+        cond = torch.cat([cond, t_emb], -1)
+        return self.unet(a_seq, cond)
+```
+
+完整实现见 https://github.com/real-stanford/diffusion_policy
+
+---
+
+## 13.5 推理加速：DDIM
+
+朴素扩散推理需要 50-100 步去噪，太慢（30Hz 控制下不够）。
+
+**DDIM**（Denoising Diffusion Implicit Models）：让推理可以**跳步**，10 步达到接近 100 步的质量。
+**Consistency Models**：1 步就能 sample。
+**Flow Matching**（π₀ 用的）：5 步达到 SOTA。
+
+工程上一般 DDIM 10 步够用。
+
+---
+
+## 13.6 卡点 FAQ
+
+**Q1：Diffusion 怎么和 RL 结合？**
+A：训练时用模仿学习；如果有 reward，可以做 Diffusion-QL（用 Q 加权采样）或 IDQL。
+
+**Q2：每步推理 10-100 次前向，怎么部署？**
+A：用 DDIM + chunk + 异步预测。chunk=16 + 10Hz 推理 = 160Hz 等效输出。
+
+**Q3：U-Net 还是 Transformer？**
+A：动作短（< 32）用 1D U-Net，长用 Transformer。Diffusion Policy 论文两个都跑过，差不多。
+
+**Q4：和 VAE / GAN 比优势？**
+A：Diffusion 训练稳定（GAN 易崩），样本质量高（VAE 模糊）。代价是推理慢。
+
+**Q5：什么时候不该用？**
+A：动作单峰（开关、PID）、推理频率要求 > 50Hz、数据少于 100 条。这些场景用普通 BC。
+
+---
+
+## 13.7 常见 Bug
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| sample 全是 NaN | beta schedule 错 / αbar 算反 | 用标准 cosine schedule |
+| sample 全在零附近 | 时间嵌入没传 | 检查 t_emb 维度 |
+| 训练 loss 不下降 | a_0 没归一化 | 把动作 normalize 到 [-1, 1] |
+| 推理慢 | 没用 DDIM | 改 sample 函数 |
+| chunk 衔接抖动 | 没做 receding horizon | 每次只执行 chunk 前几步 |
+
+---
+
+## 13.8 调参手册
+
+| 超参 | 推荐值 | 调节方向 |
+|---|---|---|
+| diffusion T | 100 (训练), 10 (推理 DDIM) | 不调 |
+| beta schedule | linear or cosine | cosine 更稳 |
+| chunk horizon | 16 | 短任务 8 |
+| action embedding dim | 128 | 不调 |
+| lr | 1e-4 | 不调 |
+| EMA decay | 0.999 | 必须有 EMA |
+| obs encoder | ResNet18 (视觉) / MLP-256 (state) | 视任务 |
+
+---
+
+## 本课收获
+
+> Diffusion Policy 用扩散模型建动作分布，能拟合任意多模态。代价是推理慢，需要 DDIM 或 chunk 技巧。
+
+## 13.9 思考题
+
+1. 为什么 Gaussian 学不到多模态？画一下 -log p(a|s) 在双峰数据上的曲线。
+2. Diffusion 的 reverse process 公式里那一堆 α / β 是什么意思？画一个 α_bar 随 t 的变化图。
+3. DDIM 跳步为什么效果还不错？这和 ODE 视角下扩散模型的关系。
+4. Diffusion Policy 论文用 chunk=16 + receding horizon。如果 chunk=1 会怎样？chunk=100 呢？
+5. **开放题**：焊接的"沿缝走"是单峰任务（动作几乎确定）。Diffusion Policy 还有优势吗？什么场景下你会真的需要它？
+
+---
+
+下一课：[第 14 课：World Models / Dreamer](14_world_models.md)

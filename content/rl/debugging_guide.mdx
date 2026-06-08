@@ -1,0 +1,254 @@
+---
+title: "RL 训练调试 checklist"
+difficulty: 1
+prereq: []
+---
+# RL 训练调试 checklist
+
+> 跨课总结的"训练出问题 → 怎么排查"指南。
+> 按**症状**组织，不按算法。出问题先来这里查，比盲目改超参快得多。
+
+---
+
+## 怎么用这份文档
+
+1. **遇到问题先描述症状**（用一句话）
+2. Ctrl+F 搜关键词（如 "loss NaN"、"reward 不涨"）
+3. 按"先排查 → 后调超参"的顺序排查
+4. **不要乱改多个东西**，一次改一个，看效果
+
+---
+
+## §1 症状：reward 一直不涨 / 上不去
+
+最常见，也最好排查。**90% 是实现 bug，不是超参**。
+
+### 排查顺序
+
+**A. 先确认 reward 设计正确**
+- [ ] 写一个"作弊"测试：手工给 agent 最优动作，reward 是否如预期？
+- [ ] 在 env 里 print(action, reward, done) 几步，看是否合理
+- [ ] reward 是否包含"前进激励"（长任务必须有，否则 agent 学摆烂，见 L12）
+
+**B. 确认数据流通**
+- [ ] obs 维度对吗？`print(env.observation_space)`
+- [ ] action 维度对吗？`print(env.action_space)`
+- [ ] PPO/SAC 里 obs 是否归一化？没归一化大状态空间几乎不可能学
+- [ ] action 是否归一化到 [-1, 1] 输出，再在 env 里反归一化到物理量？
+
+**C. 确认 loss 在更新**
+- [ ] 训练前后 model 参数变了吗？`p.data.std()` 跟踪
+- [ ] grad 范数合理吗？`p.grad.norm()` 应该是 1e-4 ~ 1e-1 量级
+- [ ] optimizer.step() 调用了吗？optimizer.zero_grad() 调用了吗？
+
+**D. 看 critic 是否在学**
+- [ ] V/Q 的预测是否随训练越来越接近实际 return？
+- [ ] critic loss 是否在下降？
+
+**E. 探索是否够**
+- [ ] PPO entropy 是否 > 0.1（CartPole 0.5 起步）？
+- [ ] DQN 的 ε 是否还在 > 0.1？
+- [ ] SAC 的 α 是否合理（看 log_alpha.exp()）？
+
+### 快速定位窍门
+**最有效的一招**：把代码改成"写死最优策略"，看 reward 是否能到目标值。能到 → reward 设计对，问题在 RL 算法；不能到 → reward 函数错了。
+
+---
+
+## §2 症状：loss 突然 NaN / Inf
+
+数值崩盘。**100% 是 bug，不是超参**。
+
+### 排查
+- [ ] 学习率太大？降到 1e-5 试试
+- [ ] reward 没归一化？大 reward 会让 V/Q 爆炸
+- [ ] log_std 没 clamp？SAC 里必须 `clamp(-20, 2)`
+- [ ] log_prob 算 0 的概率了？`torch.log(0)` = -inf
+- [ ] gradient 没 clip？加 `torch.nn.utils.clip_grad_norm_(params, 0.5)`
+- [ ] obs 里有 NaN？env 出 bug 了
+- [ ] reward 里有 NaN？reward 函数除以 0 了
+
+### 调试技巧
+```python
+# 检查所有 tensor 是否含 NaN
+def check_nan(name, t):
+    if torch.isnan(t).any() or torch.isinf(t).any():
+        print(f"{name} has NaN/Inf!")
+        breakpoint()
+
+check_nan("obs", obs)
+check_nan("loss", loss)
+```
+
+---
+
+## §3 症状：reward 涨了但又跳水
+
+涨到 200 又掉到 30，反复横跳。
+
+### 常见原因
+
+**A. Catastrophic Forgetting（DQN）**
+- target 网络硬更新时跳变 → Q 函数地形突变
+- 改：用软更新 `tau=0.005`
+
+**B. PPO 越训越差**
+- ratio 偏太远 → clip 全触发 → 等效梯度 0
+- 改：减 n_epochs（10 → 3）或减 lr
+
+**C. SAC 的 α 衰减到 0**
+- 探索全失，过早收敛到次优
+- 改：固定 α（关掉 auto-α），或调高 target_entropy
+
+**D. 经验回放分布偏移**
+- 早期烂数据还在 buffer 里影响训练
+- 改：扩大 buffer 或加优先级回放
+
+### 调试
+画三条曲线一起看：
+1. episode reward
+2. critic loss
+3. actor loss / entropy
+
+谁先抖，谁是凶手。
+
+---
+
+## §4 症状：训练超慢 / GPU 空转
+
+### 排查
+- [ ] 数据是不是没搬到 GPU？`obs.to(device)` 加上
+- [ ] env step 是 CPU 瓶颈？看 nvidia-smi 是不是 0%
+- [ ] batch_size 太小？256 起步
+- [ ] DataLoader 的 num_workers > 0？
+- [ ] 用了 PyBullet/Gazebo 这种慢仿真器？换 MuJoCo / Isaac Lab
+
+### 测量瓶颈
+```python
+import time
+t0 = time.time()
+for _ in range(100):
+    s, r, *_ = env.step(action)
+print(f"env: {(time.time()-t0)/100*1000:.2f}ms/step")
+
+t0 = time.time()
+for _ in range(100):
+    out = model(obs_batch)
+print(f"model: {(time.time()-t0)/100*1000:.2f}ms/batch")
+```
+
+env 慢就并行，model 慢就 batch 增大或减网络。
+
+---
+
+## §5 症状：仿真好用，真机崩
+
+经典 sim2real gap。
+
+### 排查
+- [ ] domain randomization 加了吗？
+- [ ] 真机控制频率和训练频率一致吗？
+- [ ] 真机延迟（控制 + 通讯）有多大？训练时模拟没有？
+- [ ] obs 顺序两边一致？写单元测试比对
+- [ ] obs 量级一致？真机相机色调、坐标系
+- [ ] action clip 在真机一侧也加了吗？防止突然大力矩
+
+### 渐进部署（见 L8）
+1. 仿真验证
+2. 仿真 + 噪声 wrapper 验证
+3. 真机重力补偿模式
+4. 真机低速度
+5. 真机正常速度
+
+每一步 gap 大就回去补 randomization。
+
+---
+
+## §6 症状：曲线看起来在涨但实际策略很烂
+
+### 可能原因
+
+**A. Reward Hacking**
+- agent 找到 reward 函数漏洞，分数高但实际不做事
+- 典型：focal-only reward 让 agent 学会停在原地（L12）
+- 改：加进度奖励 + 完成奖励
+
+**B. Eval mode 没切**
+- 训练时 dropout / batchnorm 行为不同，eval 时崩
+- 部署：`model.eval()` + `with torch.no_grad()`
+
+**C. 评估时还在用随机策略**
+- PPO 训完测试时是不是还 sample 而不是 mean？
+- 改：eval 时用 dist.mean 或 argmax
+
+---
+
+## §7 症状：模型保存 / 加载后行为不一样
+
+### 排查
+- [ ] state_dict 全部保存了吗？actor + critic + optimizer + buffer + step
+- [ ] obs / reward 归一化的 running mean / std 也保存了吗？（最常被忘）
+- [ ] 加载后 model.eval() 切了吗？
+- [ ] 用 `torch.save` 还是 `torch.jit.save`？deployment 用 jit
+
+### 完整保存模板
+```python
+checkpoint = {
+    "actor": actor.state_dict(),
+    "critic": critic.state_dict(),
+    "actor_opt": actor_opt.state_dict(),
+    "critic_opt": critic_opt.state_dict(),
+    "obs_rms_mean": obs_rms.mean.copy() if hasattr(obs_rms, 'mean') else None,
+    "obs_rms_var": obs_rms.var.copy() if hasattr(obs_rms, 'var') else None,
+    "step": step,
+}
+torch.save(checkpoint, "checkpoint.pt")
+```
+
+---
+
+## §8 症状：训练曲线方差大 / 抖动严重
+
+### 减方差的标准手段
+1. **Advantage 标准化**（PPO/A2C 必做）
+2. **更大 batch_size**
+3. **更多 n_steps**（一轮多收集数据）
+4. **Reward clipping**（[-1, 1] 是常用）
+5. **多种子求平均**：跑 3-5 个 seed 平均才是真实性能
+
+### 注意
+- 单 seed 看曲线**不可信**，RL 噪声大
+- 论文 baseline 都是 5-10 seed 求均值 ± 标准差
+
+---
+
+## §9 通用调试动作清单
+
+按出问题概率排序：
+
+1. **Print obs / action / reward 几个 step**，看是否合理（80% bug 这一步发现）
+2. **画 reward 曲线**（训练真正开始没？）
+3. **检查梯度范数**（在更新还是漂着？）
+4. **看 entropy / α**（探索还在吗？）
+5. **重跑 3 个 seed**（是真坏还是随机噪声？）
+6. **降 lr 到 1/10 看是否更稳**
+7. **如果 4-6 都不行**，怀疑实现 bug，逐行对照参考实现（stable-baselines3 / cleanrl）
+
+---
+
+## §10 工具推荐
+
+| 工具 | 用途 |
+|---|---|
+| `tensorboard` / `wandb` | 训练曲线可视化（必装）|
+| `cleanrl` | 单文件参考实现，对照看自己代码 |
+| `stable-baselines3` | 工业级 baseline，bug 少 |
+| `gymnasium-env-checker` | 检查自定义 env 是否合规 |
+| `python -m pdb` / `breakpoint()` | 关键位置打断点逐行查 |
+
+---
+
+## 一句话哲学
+
+**不要在垃圾代码上调超参。** 90% RL "训不好"的根源是实现 bug 而非超参。
+按这份 checklist 把 §1-§3 的所有项打勾，再开始动 lr。

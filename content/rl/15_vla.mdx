@@ -1,0 +1,198 @@
+---
+title: '第 15 课：VLA 模型 —— 把"大模型"装进机器人'
+difficulty: 3
+prereq: []
+---
+# 第 15 课：VLA 模型 —— 把"大模型"装进机器人
+**导航**: [← L14 World Model](14_world_models.md) · [目录](README.md) · [L16 RLHF →](16_rlhf_alignment.md)
+
+> 前提：你已经懂 PPO/SAC（在线 RL）、BC/Diffusion Policy（离线 IL）、World Model（学环境）。
+> 这一课换视角：**别从零训练机器人策略，让一个见过整个互联网的大模型来开车**。
+
+> **前情提要**: 前面所有算法都从零训机器人。这一课让大模型当机器人的'大脑'。
+
+---
+
+## 15.1 一句话先讲完
+
+**VLA = Vision-Language-Action 模型**
+
+> 输入：图像 + 自然语言指令（"焊接此 T 字接头"）
+> 输出：机器人动作（关节角速度 / 末端位姿增量 / 夹爪开合）
+
+它的关键身份：**一个 LLM/VLM（多模态大模型），但词表里多了"动作 token"**。
+
+```
+普通 VLM:    图像 + 文本 → 文本
+VLA:         图像 + 文本 → 动作 token → 解码成连续控制量
+```
+
+为什么 2023-2025 突然爆发？因为：
+1. **VLM 已经成熟**（GPT-4V, Gemini）
+2. **机器人数据开始联邦化**：Open X-Embodiment（97 万条轨迹，22 种机器人，2023）
+
+VLA 的核心赌注是：**机器人的"语义理解 + 常识推理"瓶颈靠大模型预训练直接搞定**，剩下的运动控制只需少量微调。
+
+---
+
+## 15.2 为什么不用 PPO/SAC？
+
+回想 SeamTrackingEnv：
+- 写了 reward
+- 做了 domain randomization
+- PPO 训了 100 万步
+- 结果：直焊缝行，**T 字接头抓瞎**，"焊一段、跳过铆钉、再焊"直接崩
+
+**问题不在算法，问题在"语义理解"**：PPO 学的是像素 → 动作的映射，没有"铆钉是什么"的概念。
+
+VLA 的解法：**让机器人继承一个见过互联网的大脑**。
+- 你说"跳过中间的螺栓"，它**知道**螺栓长什么样。
+- 换新工件，描述给它听，可能直接零样本工作。
+
+代价：模型大（OpenVLA 7B），推理慢（不优化 100ms+），数据依然贵。
+
+---
+
+## 15.3 演化树：RT-1 → RT-2 → OpenVLA → π₀
+
+### RT-1（Google, 2022）
+- 架构：EfficientNet + FiLM + Transformer
+- 数据：13 万条人示教
+- **不是 LLM**，从零训练的小 Transformer
+- 创新：证明大数据 + 单一模型能做 700+ 任务
+
+### RT-2（Google, 2023）— 里程碑
+- 架构：直接拿 PaLI-X / PaLM-E（已预训练 VLM）
+- **核心创新：动作离散化成 token，加进 LLM 词表**
+- co-fine-tuning：图像-文本 + 机器人任务联合训练
+- 涌现"语义抓取"（"拿起灭绝的动物" → 拿起恐龙玩具）
+
+### OpenVLA（Stanford, 2024）— 开源大爆发
+- Llama-2 7B + DINOv2 + SigLIP（双视觉编码器）
+- Open X-Embodiment 全集
+- **开源、LoRA 单卡可微调、大量评测**
+- 比 RT-2-X 强 16.5%，参数少 7 倍
+
+### π₀（Physical Intelligence, 2024）— SOTA
+- PaliGemma + **Flow Matching action expert**
+- **动作不再是离散 token，而是连续 chunk + flow matching**
+- 50Hz 输出（RT-2 才 3-5Hz）
+- π₀.5 (2025) 加 hierarchical reasoning，长任务大涨
+
+---
+
+## 15.4 核心技术拆解
+
+### 15.4.1 动作 tokenization（RT-2 路线）
+
+```python
+def discretize_action(action, n_bins=256):
+    bin_edges = np.linspace(-1, 1, n_bins + 1)
+    return [int(np.digitize(a, bin_edges) - 1) for a in action]
+```
+
+把这 256 个 bin 映射到 LLM 词表里**最少使用的 256 个 token**，既保留语言能力又能输出动作。
+
+### 15.4.2 动作 chunk + flow matching（π₀ 路线）
+
+离散化精度不够。π₀ 的解：
+1. **一次预测 action chunk**（比如未来 50 步动作）
+2. **每步动作连续向量，用 flow matching 生成**
+
+flow matching ≈ diffusion 的简化变体：学一个向量场 v(x, t)，从 noise 沿向量场积分到 action。推理只需 5-10 步。
+
+为什么 chunk 重要？高频控制下单步预测易抖动。chunk=50 + 50Hz = 1 秒规划，类似 MPC receding horizon。
+
+### 15.4.3 Open X-Embodiment 数据
+
+97 万条来自 22 种机器人。**关键问题：动作空间不一样**。
+OpenVLA 解法：**统一输出 7DoF 末端位姿增量 + gripper**。
+
+---
+
+## 15.5 数学补丁：cross-entropy 训练动作 token
+
+$$
+\mathcal{L} = -\sum_{t=1}^{T} \log p_\theta(a_t \mid I, L, a_{<t})
+$$
+
+每个 token 256 类，softmax + cross-entropy。**本质是大规模行为克隆**，但大模型先验强，泛化远超普通 BC。
+
+---
+
+## 15.6 代码：OpenVLA 推理 + LoRA 微调
+
+```python
+# 推理
+from transformers import AutoProcessor, AutoModelForVision2Seq
+import torch
+from PIL import Image
+
+processor = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
+model = AutoModelForVision2Seq.from_pretrained(
+    "openvla/openvla-7b",
+    torch_dtype=torch.bfloat16,
+    trust_remote_code=True,
+).to("cuda")
+
+def predict_action(image, instruction):
+    prompt = f"In: What action should the robot take to {instruction}?\nOut:"
+    inputs = processor(prompt, image).to("cuda", dtype=torch.bfloat16)
+    return model.predict_action(**inputs, unnorm_key="bridge_orig", do_sample=False)
+
+img = Image.open("welding_scene.jpg")
+action = predict_action(img, "track the seam from left to right")
+```
+
+LoRA 微调让 7B 模型能在单卡训：
+
+```python
+from peft import LoraConfig, get_peft_model
+
+lora_config = LoraConfig(
+    r=32, lora_alpha=16,
+    target_modules=["q_proj","v_proj","k_proj","o_proj"],
+    lora_dropout=0.05, task_type="CAUSAL_LM",
+)
+model = get_peft_model(model, lora_config)
+# 只训练 ~50M 参数
+```
+
+---
+
+## 15.7 应用到焊接：现实判断
+
+**好消息**：
+- 已有人示教录像，**只需补语言标签**
+- T 字 / 角接头 / 直缝分类，VLA 语义先验送你 30% 起点
+- 长任务（"焊三段，跳过两个螺栓"）只有 VLA 能写下来
+
+**坏消息**：
+- **频率瓶颈**：焊接需要 ≥30Hz，OpenVLA 单卡 7B 只 ~5Hz
+- **精度瓶颈**：256 bin → ~5mm 精度，焊接需要亚毫米（这是为什么 π₀ 用 flow matching）
+- **算力**：嵌入式（Jetson Orin）需要量化 + TensorRT
+
+**建议**：
+- 短期（3 月）：继续 PPO/IL 路线
+- 中期（6-12 月）：外层加 VLA 做高层任务规划，告诉低层 PPO "焊这段，跳过那段"
+- 长期：等 π₀ 类开源 + 边缘芯片更强
+
+这种分层叫 **hierarchical VLA**。
+
+---
+
+## 本课收获
+
+> VLA = 视觉 + 语言 + 动作的多模态 LLM。OpenVLA 单卡可微调；π₀ 是 SOTA 但权重未开源。
+
+## 15.8 思考题
+
+1. 对亚毫米精度的焊接，离散化 token vs flow matching 哪种合适？为什么？
+2. 100 条焊接示教，LoRA OpenVLA 还是 BC 一个小 ResNet？给三个判断维度。
+3. "把蓝色方块放进盘子" VLA 自然，"焊接 T 字接头到 3mm 余高，电流 180A" 为什么是挑战？
+4. Hierarchical VLA 相比 end-to-end VLA 的优劣？
+5. **开放题**：1 周数据采集计划，准备 VLA 微调焊接。
+
+---
+
+下一课：[第 16 课：RLHF & 机器人对齐](16_rlhf_alignment.md)

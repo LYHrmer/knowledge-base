@@ -1,0 +1,218 @@
+---
+title: "仿真器选型对比"
+difficulty: 1
+prereq: []
+---
+# 仿真器选型对比
+
+> 你在哪训 RL，决定了你能训多快、能不能上真机。
+> 这一份按"机器人 RL 工程师"视角，对比 5 个主流仿真器：MuJoCo、PyBullet、Isaac Lab、Genesis、Gazebo。
+
+---
+
+## TL;DR 选型表
+
+| 场景 | 首选 |
+|---|---|
+| 刚起步学 RL，跑 CartPole / Pendulum | gymnasium 自带 |
+| 学算法 / 单机器人精确动力学 | **MuJoCo (mujoco-py 或 dm-control)** |
+| 大规模并行训练（千个 env 同时） | **Isaac Lab** |
+| 端到端可微仿真 / 最新研究 | **Genesis** |
+| 已经在 ROS2 体系里 | **Gazebo (Ignition)** |
+| 完全免费 + 不要 GPU | PyBullet |
+
+---
+
+## 1. Gymnasium 自带（CartPole / Pendulum / MountainCar）
+
+**适合**：学算法的前 6 课。
+
+**优点**：
+- 装上 gymnasium 就能用
+- 跑得飞快（CartPole 单核 10000 FPS）
+- 全网教程最多
+
+**缺点**：
+- 物理过于简化
+- 不支持机械臂
+
+**装法**：
+```bash
+pip install gymnasium[classic-control]
+```
+
+---
+
+## 2. MuJoCo（DeepMind 开源）
+
+**适合**：学术界 RL 算法 baseline、单机器人精细动力学。
+
+**优点**：
+- 物理引擎**最准**，软接触、关节摩擦、关节限位都到位
+- 学术 SOTA 论文 90% 在 MuJoCo 跑
+- gymnasium 内置 mujoco env：HalfCheetah / Ant / Humanoid 都是它
+
+**缺点**：
+- 单 env 仿真，没法批量并行（除非 dm-control 的 batched 实现）
+- 视觉渲染一般
+
+**装法**：
+```bash
+pip install mujoco gymnasium[mujoco]
+# 跑一下
+python -c "import gymnasium as gym; env=gym.make('Ant-v4'); env.reset(); print('ok')"
+```
+
+**机器人模型**：
+- 内置 humanoid / ant / hopper / walker 等
+- 自定义 URDF：MuJoCo 用 MJCF（XML 格式），urdf2mjcf 工具能转
+
+---
+
+## 3. PyBullet（Bullet 物理 Python 绑定）
+
+**适合**：完全免费、不要 GPU、教学。
+
+**优点**：
+- 100% 免费开源
+- CPU 跑得动
+- 支持 URDF（可以直接加载机器人模型）
+- 内置很多机器人（Franka、Kuka、四足）
+
+**缺点**：
+- 物理精度比 MuJoCo 差
+- 性能一般
+- 维护略弱
+
+**装法**：
+```bash
+pip install pybullet pybullet-gym
+```
+
+**典型用法**：
+```python
+import pybullet as p
+import pybullet_data
+p.connect(p.GUI)  # 或 p.DIRECT (无界面)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+robot = p.loadURDF("kuka_iiwa/model.urdf")
+```
+
+---
+
+## 4. Isaac Lab（NVIDIA, 2024+）
+
+**适合**：大规模并行 RL 训练（4090 上 4096 个环境同时跑）。
+
+**优点**：
+- **GPU 上 4096 env 同时仿真**，是 sim2real 训四足 / 机械臂的工业标准
+- 物理引擎 PhysX 5，支持触觉、流体（部分）
+- 内置 Franka、UR、ANYmal、Spot 等
+- 训练速度比 MuJoCo 快 100-1000 倍
+
+**缺点**：
+- 必须 NVIDIA GPU（≥ RTX 30 系，最好 4080+）
+- 系统装得有点麻烦（要 Isaac Sim）
+- 学习曲线陡，文档跟不上版本节奏
+
+**装法**：
+```bash
+# 简化路线：用 conda
+conda create -n isaaclab python=3.10
+# 跟官方文档 https://isaac-sim.github.io/IsaacLab/
+```
+
+**训机器狗 / 机械臂从仿真到部署，Isaac Lab 是 2026 年事实标准**。
+
+---
+
+## 5. Genesis（CMU + 多团队, 2024 末发布）
+
+**适合**：前沿研究，端到端可微仿真。
+
+**优点**：
+- **可微物理**：环境对动作可导，能直接梯度下降优化轨迹
+- 支持软体、流体、刚体一体化
+- Pure Python（Taichi 编译到 GPU）
+- 速度快得离谱（演示数据：CPU 上一些任务比 MuJoCo 快 10-80 倍）
+
+**缺点**：
+- **太新**（2024-12 发布），生态不成熟，bug 多
+- 教程少
+- 不要为生产环境用，但实验室探索可以
+
+**装法**：
+```bash
+pip install genesis-world
+```
+
+适合"我想试最新的"，不适合"我要稳定上线"。
+
+---
+
+## 6. Gazebo（Ignition, ROS 系标配）
+
+**适合**：你的项目已经在 ROS2 体系里，要做仿真+实机集成。
+
+**优点**：
+- 和 ROS2 完美集成（rviz、tf、控制器原样工作）
+- 支持复杂场景（多机器人、传感器、地形）
+- 可视化工业级
+
+**缺点**：
+- **训 RL 慢**（实时仿真，拉不开速度）
+- 物理一般
+- 接 RL 库要自己写 wrapper（ros2-rl-bridge 之类）
+
+**装法**：
+```bash
+sudo apt install ros-humble-gazebo-ros-pkgs
+```
+
+**对你**：xiaoyu_welding 已经在 ROS2，把 RL 训练做到 MuJoCo / Isaac Lab，**部署测试用 Gazebo**，是合理分工。
+
+---
+
+## 决策树（按你的现状）
+
+```
+你有 NVIDIA GPU 吗?
+├─ 没有 → MuJoCo (CPU) 或 PyBullet
+└─ 有
+   ├─ 单环境精细动力学 → MuJoCo
+   ├─ 大规模并行 sim2real → Isaac Lab
+   ├─ 想试最新可微仿真 → Genesis
+   └─ ROS2 集成测试 → Gazebo
+```
+
+对焊接场景的实际推荐：
+1. **学习阶段（前 12 课）**：gymnasium + MuJoCo
+2. **算法验证**：MuJoCo 自定义焊接 env
+3. **大规模训练**：Isaac Lab，做 4096 个 randomized env 并行
+4. **真机前最后一步**：Gazebo + 真实焊枪 / 工件模型，测 ROS2 集成
+5. **真机部署**
+
+---
+
+## 性能对比参考（截至 2026 年初）
+
+| 仿真器 | 单 env FPS | 多 env 并行 | GPU 必需 | URDF | 机械臂 |
+|---|---|---|---|---|---|
+| Gymnasium classic | 10000+ | 单 | 否 | 否 | 否 |
+| MuJoCo | 2000-5000 | 弱 | 否 | XML 格式 | 是 |
+| PyBullet | 500-2000 | 单 | 否 | 是 | 是 |
+| Isaac Lab | 200-500/env × 4096 | 极强 | 是 | 是 | 是 |
+| Genesis | 1000+ | 中 | 部分需要 | 是 | 是 |
+| Gazebo | ~实时 | 弱 | 否 | 是 | 是 |
+
+---
+
+## 一个常见误区
+
+**新手以为"仿真器越真越好"。**
+
+错。RL 训练最大瓶颈是**采样速度**，不是单步精度。
+- MuJoCo 可能 5000 步/秒，Gazebo 可能 30 步/秒。同样训 100 万步，前者 3 分钟，后者 9 小时。
+- 你需要的是"够准但够快"，再用 domain randomization (L8) 弥补 sim-to-real gap。
+
+**先快后准，是 RL 仿真的金科玉律**。

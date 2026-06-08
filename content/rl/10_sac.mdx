@@ -1,0 +1,276 @@
+---
+title: "第 10 课：SAC（Soft Actor-Critic）★难"
+difficulty: 3
+prereq: []
+---
+# 第 10 课：SAC（Soft Actor-Critic）★难
+**导航**: [← L09 LQR / MPC](09_lqr_mpc.md) · [目录](README.md) · [L11 BC + DAgger →](11_imitation_learning.md)
+
+> **前置数学**：[00b §3 高斯分布](00b_math_primer.md#33-gaussian正态分布) · [§8 熵 / KL 散度](00b_math_primer.md#8-熵--kl-散度) · [§9 重参数化技巧](00b_math_primer.md#9-重参数化技巧)
+
+> PPO 是 on-policy（数据用一次扔），样本效率不高。
+> SAC 是 off-policy（重复使用 replay buffer），训得更快，特别适合**真机训练**和**仿真昂贵**的场景。
+> SAC 是 2018 年提出，至今（2026）仍是连续控制最强 baseline 之一。
+
+> **前情提要**: PPO 是 on-policy，数据用一次扔。这一课讲 off-policy 的 SAC——重复用 buffer 提样本效率。
+
+---
+
+## 10.1 SAC 三个核心思想
+
+1. **Actor-Critic 框架**：策略 + Q 函数都是神经网络
+2. **Off-policy + Replay**：和 DQN 一样有 buffer
+3. **最大熵**：奖励里加一项策略熵，鼓励探索 + 多样性
+
+最大熵 RL 的目标：
+
+$$
+J(\pi) = \mathbb{E}\left[\sum_t r_t + \alpha\, \mathcal{H}(\pi(\cdot|s_t))\right]
+$$
+
+第二项是策略的熵，α 是温度系数。直观：**reward 一样高时，更随机的策略更好**。
+
+---
+
+## 10.2 数学补丁：熵 / KL / 重参数化
+
+### 熵（Entropy）
+对离散分布 $p$：$\mathcal{H}(p) = -\sum_i p_i \log p_i$
+对连续分布：$\mathcal{H}(p) = -\int p(x) \log p(x) dx$
+
+**直觉**：分布越平坦熵越大；越尖锐熵越小。
+- 均匀分布：熵最大
+- delta（确定）：熵 → -∞（连续）
+
+### 重参数化（Reparameterization Trick）
+SAC 的策略输出高斯：$a \sim \mathcal{N}(\mu_\theta(s), \sigma_\theta(s))$。
+直接 sample 不可微，怎么对 θ 求梯度？
+
+**重参数化**：
+$$
+a = \mu_\theta(s) + \sigma_\theta(s) \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, 1)
+$$
+
+把随机性 ε 抽离出来，a 对 θ 可微（μ 和 σ 都是 θ 函数）。
+PyTorch 的 `dist.rsample()` 自动做这件事。
+
+---
+
+## 10.3 SAC 三个网络
+
+1. **Actor π_θ(a|s)**：输出高斯参数
+2. **Twin Critic** Q_φ1, Q_φ2：两个独立 Q 网络
+3. **Target Critic** Q_φ1', Q_φ2'：和 DQN target 一样
+
+为什么 twin？解决 Q 过估计（取两者最小值，pessimistic）。这是 TD3 论文的贡献。
+
+---
+
+## 10.4 SAC 损失
+
+### Critic loss（Bellman 残差）
+
+$$
+y = r + \gamma\left[\min_{i=1,2} Q_{\phi'_i}(s', \tilde a') - \alpha \log \pi_\theta(\tilde a' | s')\right]
+$$
+
+其中 $\tilde a' \sim \pi_\theta(\cdot|s')$。然后：
+
+$$
+\mathcal{L}_Q = \mathbb{E}\left[(Q_\phi(s, a) - y)^2\right]
+$$
+
+### Actor loss（最大熵策略）
+
+$$
+\mathcal{L}_\pi = \mathbb{E}\left[\alpha \log \pi_\theta(\tilde a|s) - \min_{i=1,2} Q_{\phi_i}(s, \tilde a)\right]
+$$
+
+直观：让策略选 Q 高的动作（第二项），同时保持高熵（第一项）。
+
+### Auto-α 调节
+α 太大策略乱跑，太小提前收敛。SAC v2 自动调：
+
+$$
+\mathcal{L}_\alpha = -\alpha \cdot (\log \pi(a|s) + \mathcal{H}_{\text{target}})
+$$
+
+让平均熵接近一个目标值（一般 -dim(A)）。
+
+---
+
+## 10.5 完整 SAC 代码（Pendulum）
+
+```python
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from collections import deque
+import random
+
+class GaussianActor(nn.Module):
+    def __init__(self, obs_dim, act_dim, act_limit):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+        )
+        self.mu = nn.Linear(256, act_dim)
+        self.log_std = nn.Linear(256, act_dim)
+        self.act_limit = act_limit
+
+    def forward(self, s):
+        h = self.net(s)
+        mu = self.mu(h)
+        log_std = torch.clamp(self.log_std(h), -20, 2)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mu, std)
+        x = normal.rsample()                # 重参数化
+        a = torch.tanh(x) * self.act_limit  # squash
+        # log_prob 修正：tanh 的雅可比
+        log_p = normal.log_prob(x).sum(-1)
+        log_p -= (2 * (np.log(2) - x - torch.nn.functional.softplus(-2*x))).sum(-1)
+        return a, log_p
+
+class QNet(nn.Module):
+    def __init__(self, obs_dim, act_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + act_dim, 256), nn.ReLU(),
+            nn.Linear(256, 256), nn.ReLU(),
+            nn.Linear(256, 1),
+        )
+    def forward(self, s, a):
+        return self.net(torch.cat([s, a], -1)).squeeze(-1)
+
+env = gym.make("Pendulum-v1")
+obs_dim = env.observation_space.shape[0]
+act_dim = env.action_space.shape[0]
+act_limit = float(env.action_space.high[0])
+
+actor = GaussianActor(obs_dim, act_dim, act_limit)
+q1, q2 = QNet(obs_dim, act_dim), QNet(obs_dim, act_dim)
+q1_t, q2_t = QNet(obs_dim, act_dim), QNet(obs_dim, act_dim)
+q1_t.load_state_dict(q1.state_dict()); q2_t.load_state_dict(q2.state_dict())
+
+actor_opt = optim.Adam(actor.parameters(), lr=3e-4)
+q_opt = optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=3e-4)
+
+# Auto-α
+log_alpha = torch.zeros(1, requires_grad=True)
+alpha_opt = optim.Adam([log_alpha], lr=3e-4)
+target_entropy = -act_dim
+
+buf = deque(maxlen=200_000)
+gamma, tau = 0.99, 0.005
+batch_size = 256
+
+s, _ = env.reset()
+for step in range(50_000):
+    if step < 1000:
+        a = env.action_space.sample()
+    else:
+        with torch.no_grad():
+            a_t, _ = actor(torch.tensor(s, dtype=torch.float32).unsqueeze(0))
+        a = a_t.numpy()[0]
+    s2, r, term, trunc, _ = env.step(a)
+    done = term or trunc
+    buf.append((s, a, r, s2, float(done)))
+    s = s2 if not done else env.reset()[0]
+
+    if len(buf) >= batch_size:
+        b = random.sample(buf, batch_size)
+        S, A, R, SN, D = map(lambda x: torch.tensor(np.array(x), dtype=torch.float32), zip(*b))
+
+        # Critic update
+        with torch.no_grad():
+            an, log_pn = actor(SN)
+            q_target = torch.min(q1_t(SN, an), q2_t(SN, an)) - log_alpha.exp() * log_pn
+            y = R + gamma * (1 - D) * q_target
+        loss_q = ((q1(S, A) - y)**2).mean() + ((q2(S, A) - y)**2).mean()
+        q_opt.zero_grad(); loss_q.backward(); q_opt.step()
+
+        # Actor update
+        a_new, log_p = actor(S)
+        q_min = torch.min(q1(S, a_new), q2(S, a_new))
+        loss_a = (log_alpha.exp() * log_p - q_min).mean()
+        actor_opt.zero_grad(); loss_a.backward(); actor_opt.step()
+
+        # Alpha update
+        loss_alpha = -(log_alpha * (log_p.detach() + target_entropy)).mean()
+        alpha_opt.zero_grad(); loss_alpha.backward(); alpha_opt.step()
+
+        # Target soft update
+        for p, p_t in zip(q1.parameters(), q1_t.parameters()):
+            p_t.data.mul_(1-tau); p_t.data.add_(tau * p.data)
+        for p, p_t in zip(q2.parameters(), q2_t.parameters()):
+            p_t.data.mul_(1-tau); p_t.data.add_(tau * p.data)
+```
+
+Pendulum 大约 30k 步（vs PPO 100k+）就能稳定，这就是 SAC 的样本效率优势。
+
+---
+
+## 10.6 卡点 FAQ
+
+**Q1：tanh squash 之后 log_prob 为什么要修正？**
+A：变换 y = tanh(x) 改变了概率密度，需要乘 1/|dy/dx| 的雅可比修正。这是标准的 change-of-variable formula。代码里那一长串就是 log Jacobian。
+
+**Q2：Twin Q 真的有用吗？**
+A：实测在多数 mujoco 任务上能提升 5-15%。关键是消除 max 偏差。
+
+**Q3：tau 软更新 vs 硬更新？**
+A：SAC 几乎都用软更新（τ=0.005 平滑）。硬更新会让 target 跳变，配 SAC 的高频更新不稳。
+
+**Q4：log_std 为什么 clamp 到 [-20, 2]？**
+A：std 太小（< exp(-20)）数值崩；太大动作离谱。这个范围基本是工业标准。
+
+**Q5：SAC vs TD3 怎么选？**
+A：连续控制，**先 SAC**。SAC 自动 α，TD3 要手调 noise。SAC 通常更稳。
+
+---
+
+## 10.7 常见 Bug
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| Q 值无限大 | target 没 detach / 没 (1-D) | 检查 with no_grad 和 done 处理 |
+| Actor loss 为 NaN | log_std 没 clamp | 加 `clamp(-20, 2)` |
+| 学不动 | 没 squash 或 log_prob 没修正 | 用上面代码模板 |
+| 探索全无 | α 衰减到 0 | 检查 auto-α 是否在更新 |
+| Buffer 内存爆 | obs 太大没归一化 | 存归一化后的 obs |
+
+---
+
+## 10.8 调参手册
+
+| 超参 | 推荐值 | 调节方向 |
+|---|---|---|
+| lr | 3e-4 | 不调 |
+| γ | 0.99 | 长任务 0.999 |
+| τ | 0.005 | 不调 |
+| batch_size | 256 | 显存允许更大 |
+| Replay 容量 | 1e5 ~ 1e6 | 看任务复杂度 |
+| target_entropy | -act_dim | 标准选择 |
+| 起始随机步数 | 1000 ~ 10000 | 复杂任务多收集 |
+| log_std 范围 | [-20, 2] | 不调 |
+
+---
+
+## 本课收获
+
+> SAC = Twin Q + 最大熵 + 重参数化 + auto-α。连续控制 SOTA，特别适合真机训练。
+
+## 10.9 思考题
+
+1. SAC 的"最大熵"项和 PPO 的 entropy bonus 有什么区别？
+2. 为什么 SAC 需要 twin Q 而 DQN 一般不需要？
+3. 重参数化让梯度能流过 sample 操作。如果不重参数化、用 score function（REINFORCE 那种），会怎样？
+4. SAC 是 off-policy，但 actor 损失里用的 a 是当前策略采样的（on-policy 的味道）。这矛盾吗？
+5. **开放题**：在焊接 sim2real 上用 SAC 还是 PPO？给三个具体维度的判断。
+
+---
+
+下一课：[第 11 课：BC + DAgger](11_imitation_learning.md)

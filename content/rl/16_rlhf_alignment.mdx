@@ -1,0 +1,276 @@
+---
+title: "第 16 课：RLHF & 机器人对齐"
+difficulty: 3
+prereq: []
+---
+# 第 16 课：RLHF & 机器人对齐
+**导航**: [← L15 VLA](15_vla.md) · [目录](README.md) · [回到目录 →](README.md)
+
+> **前置数学**：[00b §3 sigmoid](00b_math_primer.md#3-概率分布三个必须会的) · [§5 log 技巧](00b_math_primer.md#5-log-与-log-导数技巧最重要的一节) · [§8 KL 散度](00b_math_primer.md#8-熵--kl-散度)
+
+> 前提：你已经懂 PPO（L6）、BC（L11）、VLA（L15）。
+> 核心问题：**当 reward 函数写不出来的时候，怎么办？**
+
+> **前情提要**: 前 15 课都假设 reward function 写得出来。这一课处理'写不出来'的情况——从人偏好里学。
+
+---
+
+## 16.1 一句话先讲完
+
+**RLHF = Reinforcement Learning from Human Feedback**
+
+> 不让人写 reward 函数，让人**对比两条轨迹哪条好**，从偏好里学一个 reward 模型，再用 PPO 优化策略。
+
+```
+传统 RL:        策略 → 环境给 reward → 优化
+RLHF:           策略 → 两条轨迹 A,B → 人选哪条好 → Reward Model → PPO
+```
+
+**为什么对机器人重要**？焊接的"好"也写不出来：
+- 焊缝外观平滑？怎么定义？
+- 飞溅少？多少叫少？
+
+老焊工一眼能看出哪条好，**他们的眼睛就是 reward**。
+
+---
+
+## 16.2 三阶段流水线（ChatGPT 范式）
+
+```
+Stage 1: SFT (Supervised Fine-Tuning)
+   收集"标准答案"做 BC → π_SFT
+
+Stage 2: RM (Reward Model) 训练
+   收集偏好对 (A, B, A>B)
+   训 r_φ(s, a) 让 r(A) > r(B)
+
+Stage 3: RLHF
+   PPO 优化 π，目标是 r_φ
+   加 KL 惩罚防止偏离 π_SFT 太远
+```
+
+机器人 RLHF 完全照搬。
+
+---
+
+## 16.3 Stage 2：从偏好学 Reward Model
+
+### 偏好数据
+```python
+sample = {
+    "trajectory_A": [(s_0, a_0), ...],
+    "trajectory_B": [(s_0', a_0'), ...],
+    "label": "A"
+}
+```
+
+### Bradley-Terry 模型（数学补丁）
+
+人选 A 的概率，由两条轨迹 reward 之差通过 sigmoid 决定：
+
+$$
+P(A \succ B) = \sigma(R(A) - R(B))
+$$
+
+其中 $R(\tau) = \sum_t r_\phi(s_t, a_t)$。
+
+直观：
+- $R(A) - R(B) = 0$（一样好）→ P=0.5
+- $R(A) - R(B) = 2$（A 好很多）→ P=0.88
+
+训练目标（最大似然）：
+
+$$
+\mathcal{L}_{\text{RM}} = -\mathbb{E}\left[\log\sigma\big(R_\phi(\tau_y) - R_\phi(\tau_{\bar y})\big)\right]
+$$
+
+### 代码（核心 20 行）
+
+```python
+class RewardModel(nn.Module):
+    def __init__(self, obs_dim, act_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + act_dim, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, 1),
+        )
+    def forward(self, s, a):
+        return self.net(torch.cat([s, a], -1)).squeeze(-1)
+    def trajectory_reward(self, traj):
+        return torch.stack([self.forward(s, a) for s, a in traj]).sum()
+
+def train_rm(model, dataset, n_epochs=10):
+    opt = torch.optim.Adam(model.parameters(), lr=3e-4)
+    for epoch in range(n_epochs):
+        for traj_A, traj_B, label in dataset:
+            R_A = model.trajectory_reward(traj_A)
+            R_B = model.trajectory_reward(traj_B)
+            logits = R_A - R_B
+            target = torch.tensor(1.0 if label == "A" else 0.0)
+            loss = nn.functional.binary_cross_entropy_with_logits(logits, target)
+            opt.zero_grad(); loss.backward(); opt.step()
+```
+
+### 数据效率
+- ChatGPT RM：~10 万条偏好
+- DeepMind 后空翻（Christiano 2017）：**900 条**就成功
+- 焊接预估：**500-2000 条**够用
+
+---
+
+## 16.4 Stage 3：PPO + KL 惩罚
+
+完整目标：
+
+$$
+\mathcal{J}(\theta) = \mathbb{E}\left[r_\phi(s,a)\right] - \beta\, D_{\text{KL}}\left[\pi_\theta\,\|\,\pi_{\text{SFT}}\right]
+$$
+
+### 为什么要 KL 惩罚？
+
+**Reward Hacking**：RM 是有限数据上训出来的近似。PPO 自由优化会**找出 RM 的漏洞**。
+
+LLM 例子：没 KL 时模型疯狂重复"很棒！" → RM 给高分；加 KL 后保持在 SFT 附近。
+
+机器人例子：焊接 RM 喜欢"焊缝光滑" → PPO 学会**根本不焊**让焊枪悬停（确实光滑没飞溅）。KL 防止漂走。
+
+### 实现
+
+```python
+def compute_reward(state, action, rm, sft_policy, current_policy, beta=0.1):
+    r_main = rm(state, action)
+    log_p_new = current_policy.log_prob(action, state)
+    log_p_sft = sft_policy.log_prob(action, state)
+    kl_penalty = beta * (log_p_new - log_p_sft)
+    return r_main - kl_penalty
+```
+
+β 是关键超参，LLM 一般 0.01-0.2，机器人通常 0.1-1.0。
+
+---
+
+## 16.5 现代变种：DPO
+
+**痛点**：RLHF 要训 RM + 跑 PPO，链路长易崩。
+
+**DPO（2023）的洞察**：跳过 RM，直接从偏好数据训策略：
+
+$$
+\mathcal{L}_{\text{DPO}} = -\mathbb{E}\left[\log\sigma\left(\beta\log\frac{\pi_\theta(a_w|s)}{\pi_{\text{SFT}}(a_w|s)} - \beta\log\frac{\pi_\theta(a_l|s)}{\pi_{\text{SFT}}(a_l|s)}\right)\right]
+$$
+
+直观：让 π 在偏好动作 a_w 上的概率比 SFT 高，在 a_l 上比 SFT 低。
+
+```python
+def dpo_loss(policy, sft_policy, batch, beta=0.1):
+    s, a_w, a_l = batch["state"], batch["winner_action"], batch["loser_action"]
+    logp_w = policy.log_prob(a_w, s)
+    logp_l = policy.log_prob(a_l, s)
+    with torch.no_grad():
+        logp_w_sft = sft_policy.log_prob(a_w, s)
+        logp_l_sft = sft_policy.log_prob(a_l, s)
+    logits = beta * ((logp_w - logp_w_sft) - (logp_l - logp_l_sft))
+    return -torch.nn.functional.logsigmoid(logits).mean()
+```
+
+**优势**：不需 RM，不需 rollout，离线训练稳得多。
+**对机器人**：500 对偏好就能微调 OpenVLA。
+
+---
+
+## 16.6 应用到焊接：完整方案
+
+### 三阶段流程
+**Stage 1 - SFT**：100 条人示教 BC 出 π_SFT。
+**Stage 2 - RM**：让 π_SFT 跑 200 次焊接录像，3 位老焊工每对选一个 → 600 条偏好。训 RM ~30 分钟单卡。
+**Stage 3 - RLHF**：仿真里跑 PPO（不能真机！），reward = RM - β·KL，训 100 万步，sim2real。
+
+### 关键工程
+
+**问题 1：偏好不一致**
+- 解法：每对 ≥3 人标，多数投票或保留分歧加权。
+
+**问题 2：偏好的多维度**
+- "A 好"是因为飞溅少？平滑？快？
+- 解法：**分维度 RM**：
+
+```python
+total_reward = w_1 * rm_splash(s,a) + w_2 * rm_smoothness(s,a) + w_3 * rm_speed(s,a)
+```
+
+权重让工艺工程师调，灵活很多。
+
+**问题 3：Reward Hacking 监控**
+- 训练时定期人工抽查
+- RM 分数涨但人评下降 → 立刻停训补数据
+
+### vs 手写 reward + PPO
+
+| 项 | 手写 reward + PPO | RLHF |
+|---|---|---|
+| 起步成本 | 低 | 高（需偏好采集）|
+| 长期上限 | 低 | 高 |
+| 可解释性 | 高 | 低 |
+| Hacking 风险 | 中 | 高 |
+| 适用阶段 | 原型验证 | 产品打磨 |
+
+**实战建议**：先手写 reward 跑 baseline，**再** RLHF 提质。
+
+---
+
+## 16.7 机器人对齐（Alignment）
+
+RLHF 是对齐的一种手段。**对齐 = 让 AI 系统按人类意图行事，即使在训练分布外**。
+
+机器人对齐的特殊挑战：
+1. **物理不可逆**：撞坏改不回来
+2. **隐含约束**："别撞人"不在 reward 里也不能违反
+3. **任务边界**：用户说"焊接此缝"，不应该顺手挪工件
+
+主流方向（截至 2025）：
+- **Constitutional AI**（Anthropic）：用文字写"宪法"
+- **Safe RL**：CMDP 加 constraint
+- **Shielding**：执行前规则验证器拦截
+- **RLAIF**：AI 反馈代替人反馈，成本更低
+
+焊接落地最现实：
+- **硬约束**：碰撞检测、电流上限，ROS2 节点拦截
+- **软约束**：RLHF 让风格符合工艺标准
+- **运行时监控**：异常分数高停机让人检查
+
+---
+
+## 本课收获
+
+> RLHF 三阶段 + DPO 单阶段。机器人对齐 = 软约束（RLHF）+ 硬约束（碰撞 / 限位）+ 运行时监控。
+
+## 16.8 思考题
+
+1. RLHF 用 sigmoid 把 reward 之差变成偏好概率，**为什么不用 softmax**？
+2. KL 惩罚里 β 太大太小分别什么问题？联系 SAC 里 α 的作用对比。
+3. DPO 把 RM 显式去掉了，但**它内部其实还在隐式学一个 reward**。请用 DPO 公式反推。
+4. 两位老焊工对同一对录像选了相反偏好，怎么处理？给三种方案比较。
+5. **开放题**：写 1 页"焊接 RLHF 标注指南"。
+
+---
+
+## 全部 16 课结业 🎓
+
+```
+基础篇:        L1 MDP    →  L2 Q-learning  →  L3 DQN★
+策略梯度:      L4 REINFORCE  →  L5 A2C  →  L6 PPO★
+sim-to-real:   L7 自定义 env  →  L8 ROS2 部署
+经典控制:      L9 LQR / MPC
+现代算法栈:    L10 SAC★  →  L11 BC + DAgger
+端到端实战:    L12 焊接全流程
+前沿方向:      L13 Diffusion★  →  L14 World Model  →  L15 VLA  →  L16 RLHF
+```
+
+接下来怎么走：
+1. 把 L1-L6 的代码全部跑过一遍，亲眼看到 reward 曲线
+2. 用 L7 的 env 模板包一个你自己的小任务，跑 PPO
+3. 真要上焊接，按 L12 的 8 项部署清单逐一对齐
+4. 想做前沿研究，从 L13 / L15 选一个方向深挖
+
+**RL 不是调参玄学。它是可解释的工程。** 祝你训练曲线一路向上。

@@ -1,0 +1,947 @@
+---
+title: "第 0b 课：RL 数学补完（零基础友好）"
+difficulty: 1
+prereq: []
+---
+# 第 0b 课：RL 数学补完（零基础友好）
+
+> 这一份是"看不懂公式时回来翻"的字典。
+> 假设你高数 / 线代 / 概率论都**忘得差不多**，全部从直觉重讲，每个概念至少一个具体数字例子。
+> 不是要你 30 分钟变数学家，是让你**看到 RL 公式不再恐慌**。
+
+---
+
+## 怎么用这份文档
+
+- 不要从头啃完。**先跳过来看路线图，知道哪节讲了什么**。
+- 在某课卡在公式时，回来查对应小节。
+- 每节末尾有一个"在 RL 哪用到"，告诉你为什么要学这玩意。
+
+### 路线图
+
+| 节 | 主题 | 在 RL 哪用到 |
+|---|---|---|
+| §1 | 函数 / 导数 / 梯度 | 神经网络训练，全程必用 |
+| §2 | 链式法则 | 反向传播 |
+| §3 | 概率分布（Bernoulli / Categorical / Gaussian） | 策略网络的输出 |
+| §4 | 期望与方差 | RL 的目标函数 |
+| §5 | log 与 log 导数技巧 | 策略梯度（L4-L6 灵魂）|
+| §6 | 联合概率 / 条件概率 | 轨迹概率 |
+| §7 | 矩阵 / 向量 / 二次型 | LQR (L9), 价值函数 |
+| §8 | 熵 / KL 散度 | SAC (L10), RLHF (L16) |
+| §9 | 重参数化技巧 | SAC (L10), Diffusion (L13) |
+| §10 | 重要性采样 | PPO (L6) |
+| §11 | 期望的梯度 | 策略梯度定理 |
+| §12 | 大数定律 / 蒙特卡洛 | 为什么"采样平均 ≈ 期望" |
+| §13 | Softmax 与离散策略 | 策略输出层（DQN 推 / Categorical 必读）|
+| §14 | 似然 / 最大似然 / 交叉熵 | 把"训练目标"统一起来（BC、RM、分类全是它）|
+| §15 | 多维高斯 / 协方差矩阵 | 多维连续动作策略 |
+| §16 | 蒙特卡洛 vs TD（bootstrapping） | A2C、GAE、SAC 的 Q 估计 |
+| §17 | 完整 worked examples | 5 个手算练习巩固 |
+| §18 | 梯度下降的几何 | 神经网络训练直觉 |
+
+---
+
+## §1 函数 / 导数 / 梯度
+
+### 函数 = 输入 → 输出的"加工厂"
+$f(x) = x^2$，输入 3，输出 9。
+$f(x, y) = x + 2y$，输入 (1, 3)，输出 7。
+
+### 导数 = "x 变 1 单位时 f 变多少"
+
+$f(x) = x^2$，$f'(x) = 2x$。
+- 在 x=3：导数 6。意思是 x 从 3 变 3.01，f 大约从 9 变 9.06（多 0.06=6×0.01）。
+- 在 x=0：导数 0。x 周围 f 几乎不变（碗底）。
+
+**几何意义**：导数是切线斜率。
+
+```
+f(x) = x²
+                          
+       │    .              
+       │   .    斜率 = 6 = f'(3)
+       │  .  /             
+   9 ──┤·── ●                 
+       │.  /│              
+       │  / │              
+       └────┴───────  
+        0   3  →  x
+```
+
+### 梯度 = 多变量的导数集合
+
+$f(x, y) = x^2 + 3y$
+- 对 x 的偏导：$\partial f/\partial x = 2x$
+- 对 y 的偏导：$\partial f/\partial y = 3$
+- 梯度：$\nabla f = (2x, 3)$
+
+**直觉**：$\nabla f$ 是箭头，指向 f 增长最快的方向。
+"梯度下降"就是逆箭头方向走，让 f 变小。
+
+```python
+# 训练神经网络的本质
+loss.backward()       # 算梯度
+opt.step()            # θ ← θ - lr · ∇loss
+```
+
+### 在 RL 哪用到
+- 神经网络更新：θ ← θ - lr · ∇L(θ)
+- 策略梯度：θ ← θ + lr · ∇J(θ)（注意是 +，因为要最大化 J）
+
+---
+
+## §2 链式法则
+
+复合函数求导：
+
+$$y = f(g(x)) \implies \frac{dy}{dx} = f'(g(x)) \cdot g'(x)$$
+
+具体例子：$y = (x + 2)^2$
+- 内层 $g(x) = x + 2$，导数 1
+- 外层 $f(u) = u^2$，导数 $2u$
+- 合起来：$\frac{dy}{dx} = 2(x+2) \cdot 1 = 2(x+2)$
+
+x=3 时：y = 25，导数 = 10。验证：x=3.01 时 y ≈ 25.1 ✓
+
+### 多层链式
+
+```
+x → 神经层1 → h1 → 神经层2 → h2 → loss
+```
+
+$$\frac{\partial \text{loss}}{\partial \theta_1} = \frac{\partial \text{loss}}{\partial h_2} \cdot \frac{\partial h_2}{\partial h_1} \cdot \frac{\partial h_1}{\partial \theta_1}$$
+
+**反向传播 = 链式法则的工业化执行**。PyTorch 的 `.backward()` 就在做这件事，你不用手算。
+
+### 在 RL 哪用到
+- 策略 / 值网络的训练，无处不在
+- DDPG / SAC 的 actor 损失通过 Q 网络反向传播
+
+---
+
+## §3 概率分布：三个必须会的
+
+### 3.1 Bernoulli（抛硬币）
+
+参数 p ∈ [0, 1]。
+- 输出 1 的概率 p
+- 输出 0 的概率 1-p
+
+例：p=0.7 的硬币，扔 10 次大约 7 次正面。
+
+**RL 用法**：动作只有"按 / 不按"时，策略输出 p。
+
+### 3.2 Categorical（多面骰子）
+
+参数 (p_1, ..., p_K)，加起来等于 1。
+例：4 个动作，p = (0.1, 0.2, 0.3, 0.4)。
+
+**RL 用法**：离散动作策略（CartPole 选左/右）。
+
+```python
+import torch
+dist = torch.distributions.Categorical(probs=torch.tensor([0.1, 0.2, 0.3, 0.4]))
+a = dist.sample()           # 大概率 3
+log_p = dist.log_prob(a)    # log(0.4) = -0.916
+```
+
+### 3.3 Gaussian（正态分布）
+
+参数：均值 μ，标准差 σ。
+
+$$p(x) = \frac{1}{\sigma\sqrt{2\pi}} \exp\left(-\frac{(x-\mu)^2}{2\sigma^2}\right)$$
+
+直观：钟形曲线，μ 是中心，σ 是宽度。
+- μ=0, σ=1：标准正态。99% 的样本落在 [-3, 3]
+- μ=10, σ=2：中心在 10，99% 落在 [4, 16]
+
+**RL 用法**：连续动作策略（焊枪速度）。网络输出 μ 和 σ，动作 a ~ N(μ, σ)。
+
+```python
+dist = torch.distributions.Normal(loc=0.0, scale=1.0)
+a = dist.sample()            # 大概率在 [-3, 3]
+log_p = dist.log_prob(a)     # 这个 a 在分布里有多大可能
+```
+
+---
+
+## §4 期望与方差
+
+### 期望 = "平均值"
+
+离散：$\mathbb{E}[X] = \sum_x p(x) \cdot x$
+连续：$\mathbb{E}[X] = \int p(x) \cdot x \, dx$
+
+例：骰子掷一次 X 的期望
+$$\mathbb{E}[X] = 1 \cdot \frac{1}{6} + 2 \cdot \frac{1}{6} + ... + 6 \cdot \frac{1}{6} = 3.5$$
+
+例：策略选动作 0 或 1，p=(0.7, 0.3)，reward 分别是 +5、-2
+$$\mathbb{E}[R] = 0.7 \cdot 5 + 0.3 \cdot (-2) = 3.5 - 0.6 = 2.9$$
+
+**关键性质**：
+- 线性性：$\mathbb{E}[aX + bY] = a\mathbb{E}[X] + b\mathbb{E}[Y]$
+- 函数：$\mathbb{E}[f(X)] = \sum_x p(x) f(x)$
+
+### 方差 = "数据散得多开"
+
+$$\text{Var}(X) = \mathbb{E}[(X - \mathbb{E}[X])^2]$$
+
+骰子方差：(1-3.5)²/6 + (2-3.5)²/6 + ... ≈ 2.92。
+全是 3.5 的"骰子"方差为 0。
+
+### 在 RL 哪用到
+- RL 目标 $J(\theta) = \mathbb{E}_\tau[R(\tau)]$ —— 最大化期望回报
+- 方差大 = 训练抖动大。降低方差是 A2C / GAE 的核心动机
+
+---
+
+## §5 log 与 log 导数技巧（最重要的一节）
+
+### log 是什么
+$\log(8) = 3$ 因为 $2^3 = 8$（这里是 log_2，机器学习里 log 默认 e 为底）。
+
+**自然对数性质**：
+- $\log(ab) = \log a + \log b$（乘变加）
+- $\log(a/b) = \log a - \log b$（除变减）
+- $\log(a^n) = n \log a$（幂变乘）
+
+### 为什么 RL 公式里到处是 log
+
+**原因 1：把乘法变加法**
+
+策略生成轨迹 $\tau = (a_1, a_2, \ldots, a_T)$ 的概率：
+$$p(\tau) = \pi(a_1) \cdot \pi(a_2) \cdots \pi(a_T)$$
+
+$$\log p(\tau) = \log \pi(a_1) + \log \pi(a_2) + \cdots + \log \pi(a_T)$$
+
+求和比连乘**数值稳定**得多（连乘 1000 个 0.1 → 1e-1000 下溢；求和 1000 个 -2.3 → -2300 没事）。
+
+**原因 2：log 导数技巧（log-derivative trick）**
+
+观察一个数学等式：
+$$\nabla_\theta \pi_\theta(a) = \pi_\theta(a) \cdot \nabla_\theta \log \pi_\theta(a)$$
+
+证明（一行）：$\nabla \log \pi = \frac{\nabla \pi}{\pi}$，两边乘 π 即得。
+
+**为什么有用**：让我们能把"对概率求梯度"变成"对 log 概率求梯度 × 概率"，而 log 概率正是 PyTorch 默认输出（`dist.log_prob(a)`）。
+
+### 实战例子（策略梯度推导）
+
+目标：$J(\theta) = \mathbb{E}_{a \sim \pi_\theta}[R(a)] = \sum_a \pi_\theta(a) R(a)$
+
+求梯度：
+$$\nabla_\theta J = \sum_a \nabla_\theta \pi_\theta(a) \cdot R(a) = \sum_a \pi_\theta(a) \nabla_\theta \log \pi_\theta(a) \cdot R(a) = \mathbb{E}_{a \sim \pi}[\nabla \log \pi(a) \cdot R(a)]$$
+
+**这就是策略梯度定理（L4 的核心）**。看不懂时回这里看一遍。
+
+### 在 RL 哪用到
+- 策略梯度 / REINFORCE / A2C / PPO 全都用 log 概率
+- DPO / RLHF（L16）的损失里也是 log 比
+
+---
+
+## §6 联合概率 / 条件概率
+
+### 联合 P(A, B) = "A 和 B 同时发生的概率"
+
+例：扔两骰子，P(第一个=3, 第二个=5) = 1/6 × 1/6 = 1/36（独立时相乘）。
+
+### 条件 P(A | B) = "已知 B 发生，A 的概率"
+
+例：已知第一个骰子=3，第二个=5 的概率 = 1/6（独立，所以等于无条件）。
+例：抽两张牌，已知第一张是红桃，第二张也是红桃的概率 = 12/51（不独立）。
+
+### 链式法则（概率版）
+
+$$P(A_1, A_2, \ldots, A_n) = P(A_1) \cdot P(A_2|A_1) \cdot P(A_3|A_1, A_2) \cdots$$
+
+应用：轨迹的概率
+$$p(\tau) = p(s_0) \prod_{t=0}^{T} \pi(a_t|s_t) \cdot P(s_{t+1}|s_t, a_t)$$
+
+### 在 RL 哪用到
+- 轨迹概率（PPO 的 importance ratio）
+- 行为克隆的最大似然
+
+---
+
+## §7 矩阵 / 向量 / 二次型
+
+### 向量 = 一列数
+
+$\mathbf{x} = (1, 2, 3)$ 是 3 维向量。
+
+点积：$\mathbf{x} \cdot \mathbf{y} = x_1 y_1 + x_2 y_2 + \cdots$
+例：$(1, 2, 3) \cdot (4, 5, 6) = 4 + 10 + 18 = 32$
+
+### 矩阵 = 一组向量
+
+$$A = \begin{pmatrix} 1 & 2 \\ 3 & 4 \end{pmatrix}$$
+
+矩阵乘向量：A x，按行点积。
+$A \cdot (5, 6)^T = (1·5+2·6, 3·5+4·6)^T = (17, 39)^T$
+
+### 二次型
+
+$$\mathbf{x}^T Q \mathbf{x} = \sum_{ij} Q_{ij} x_i x_j$$
+
+例：$Q = \begin{pmatrix} 1 & 0 \\ 0 & 4 \end{pmatrix}$，$\mathbf{x} = (a, b)^T$
+$$\mathbf{x}^T Q \mathbf{x} = 1 \cdot a^2 + 4 \cdot b^2$$
+
+**直觉**：二次型是关于 x 的"加权平方和"。Q 的对角线决定每个分量的权重。
+
+### 正定（positive definite）
+
+矩阵 Q 正定 ⟺ 对任意 $\mathbf{x} \neq 0$，$\mathbf{x}^T Q \mathbf{x} > 0$。
+
+直观：碗状的二次曲面（向上凸），像 $f(x) = x^2$ 而不是 $f(x) = -x^2$。
+
+### 在 RL 哪用到
+- LQR (L9) 的代价函数 $\mathbf{x}^T Q \mathbf{x} + \mathbf{u}^T R \mathbf{u}$
+- 神经网络的输入输出向量化操作
+- 协方差矩阵（高斯多维版）
+
+---
+
+## §8 熵 / KL 散度
+
+### 熵 = "分布有多平均"
+
+$$\mathcal{H}(p) = -\sum_x p(x) \log p(x)$$
+
+例：均匀骰子（每面 1/6）
+$\mathcal{H} = -6 \cdot \frac{1}{6} \log \frac{1}{6} \approx 1.79$（最大可能，6 个事件）
+
+例：作弊骰子（永远是 6，p(6)=1）
+$\mathcal{H} = -1 \cdot \log 1 = 0$
+
+**直觉**：
+- 均匀分布 → 熵最大（最不确定）
+- 集中分布 → 熵最小（最确定）
+
+### KL 散度 = "用 q 编码 p 多花的比特"
+
+$$D_{KL}(p \| q) = \sum_x p(x) \log \frac{p(x)}{q(x)}$$
+
+性质：
+- $D(p\|q) \geq 0$，等号当 p = q
+- **不对称**：$D(p\|q) \neq D(q\|p)$
+- 不是距离（不满足三角不等式）
+
+具体例子：
+- $p = (0.5, 0.5)$, $q = (0.5, 0.5)$ → KL = 0
+- $p = (0.9, 0.1)$, $q = (0.5, 0.5)$ → KL ≈ 0.37
+- $p = (1.0, 0.0)$, $q = (0.5, 0.5)$ → KL = ∞ × 0 还是 ∞？取 0 log 0 = 0 约定，所以 = log 2 ≈ 0.69
+
+### 在 RL 哪用到
+- SAC (L10)：策略熵进 reward，鼓励多样
+- PPO (L6)：旧策略 vs 新策略的 KL 用作"步长"约束
+- RLHF (L16)：KL(π || π_SFT) 防 reward hacking
+- Dreamer (L14)：posterior 和 prior 的 KL
+
+---
+
+## §9 重参数化技巧
+
+### 问题
+
+策略输出 $a \sim \mathcal{N}(\mu_\theta, \sigma_\theta)$。
+我们想算 $\nabla_\theta \mathbb{E}[Q(a)]$。
+
+直接 sample 不可微（sample 是个随机操作，没有梯度）。
+
+### 解法
+
+把随机性 ε 抽离：
+
+$$a = \mu_\theta + \sigma_\theta \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, 1)$$
+
+现在 a 关于 θ 是确定函数，可微！梯度直接传：
+$$\nabla_\theta Q(a) = \nabla_a Q(a) \cdot \nabla_\theta a = \nabla_a Q(a) \cdot (\nabla\mu_\theta + \epsilon \cdot \nabla\sigma_\theta)$$
+
+PyTorch 的 `dist.rsample()` 自动做这件事。
+
+### 在 RL 哪用到
+- SAC (L10) 的 actor 损失
+- VAE / Diffusion (L13) 的训练
+- Reparameterization 是现代深度概率模型的基石
+
+---
+
+## §10 重要性采样（Importance Sampling）
+
+### 问题
+
+我有一堆数据是从分布 q 采的，但想算关于分布 p 的期望。
+
+### 公式
+
+$$\mathbb{E}_{x \sim p}[f(x)] = \mathbb{E}_{x \sim q}\left[\frac{p(x)}{q(x)} f(x)\right]$$
+
+**直觉**：把每个样本按"它在 p 下相对 q 多常见"加权。
+
+### 例子
+
+q = 均匀分布，p = 偏向 1 的分布。
+我从 q 采到 x=1 比较多，但 q 里它没特别多。p 里 x=1 是大热门。
+$\frac{p(1)}{q(1)}$ 很大 → x=1 的样本权重大 → 期望算的就是 p 下的。
+
+### 在 RL 哪用到
+- PPO (L6) 的 ratio = π_θ(a) / π_old(a)
+- Off-policy 学习
+
+---
+
+## §11 期望的梯度（策略梯度定理证明）
+
+把前面几节串起来。目标：
+
+$$J(\theta) = \mathbb{E}_{\tau \sim \pi_\theta}[R(\tau)]$$
+
+为什么 $\nabla_\theta J = \mathbb{E}_\tau[\sum_t \nabla \log \pi_\theta(a_t|s_t) \cdot R(\tau)]$？
+
+证明（要用 §5 的 log 技巧 + §6 的轨迹概率）：
+
+**Step 1**：展开期望
+$$J(\theta) = \int p_\theta(\tau) R(\tau) \, d\tau$$
+
+**Step 2**：求梯度（只 p 含 θ）
+$$\nabla J = \int \nabla p_\theta(\tau) R(\tau) \, d\tau$$
+
+**Step 3**：log 技巧
+$$\nabla p_\theta = p_\theta \cdot \nabla \log p_\theta$$
+
+代入：
+$$\nabla J = \int p_\theta(\tau) \nabla \log p_\theta(\tau) R(\tau) d\tau = \mathbb{E}_\tau[\nabla \log p_\theta(\tau) R(\tau)]$$
+
+**Step 4**：展开 $\log p_\theta(\tau)$。轨迹概率 = 初始 × 转移 × 策略，但**只有策略含 θ**：
+$$\log p_\theta(\tau) = \underbrace{\log p(s_0) + \sum_t \log P(s_{t+1}|s_t,a_t)}_{\text{无 } \theta} + \sum_t \log \pi_\theta(a_t|s_t)$$
+
+求梯度时无 θ 那部分变 0：
+$$\nabla \log p_\theta(\tau) = \sum_t \nabla \log \pi_\theta(a_t | s_t)$$
+
+**Step 5**：合并
+$$\nabla J = \mathbb{E}_\tau\left[\sum_t \nabla \log \pi_\theta(a_t|s_t) \cdot R(\tau)\right] \quad \blacksquare$$
+
+**这就是 L4 的策略梯度定理**。第一次看不懂正常，多读几遍就通了。
+
+---
+
+## §12 大数定律 / 蒙特卡洛 —— 为什么"采样平均 ≈ 期望"
+
+### 问题
+
+RL 公式里到处是"期望 $\mathbb{E}$"。但你电脑算不了无穷积分，怎么办？
+**答案**：采样很多次，取平均，就近似等于期望。
+
+这件事数学上叫**大数定律（Law of Large Numbers, LLN）**：
+
+$$
+\frac{1}{N}\sum_{i=1}^{N} X_i \xrightarrow{N \to \infty} \mathbb{E}[X]
+$$
+
+### 直觉示范
+
+骰子期望 $\mathbb{E}[X] = 3.5$。
+扔 N 次骰子取平均：
+
+| N | 平均值（举例）|
+|---|---|
+| 5 | 2.8（噪声大）|
+| 50 | 3.4 |
+| 500 | 3.51 |
+| 5000 | 3.498 |
+| 50000 | 3.5002 |
+
+**N 越大越接近 3.5**。这就是大数定律。
+
+### 蒙特卡洛估计
+
+任何复杂期望都可以这样估：
+- 想算 $\mathbb{E}_{x \sim p}[f(x)]$？从 p 采 N 个 x，算 $\frac{1}{N}\sum f(x_i)$
+- N 越大估计越准，方差按 1/N 下降
+
+### 在 RL 哪用到
+- REINFORCE：用单条轨迹 G_t 估期望回报（**N=1 的极端蒙特卡洛**，所以方差极大）
+- DQN target：用一个 batch 的 (s, a, r, s') 估 Bellman 期望
+- A2C 的 V 估计、PPO 的 advantage 估计、SAC 的 Q 估计——**全部是蒙特卡洛**
+
+### 关键洞察：方差 vs 偏差
+
+蒙特卡洛是**无偏**估计（N 足够大就准），但**方差大**（小 N 时抖动凶）。
+RL 一大堆技巧（baseline、GAE、target network）都是在**降方差**。
+
+---
+
+## §13 Softmax 详解 —— 离散策略和分类问题的根
+
+### 什么是 softmax
+
+输入：K 个任意实数 $z_1, \ldots, z_K$（叫 **logits**）
+输出：K 个非负数，加起来等于 1（即一个概率分布）
+
+公式：
+$$
+p_i = \frac{e^{z_i}}{\sum_{j=1}^{K} e^{z_j}}
+$$
+
+### 用具体数字算一遍
+
+logits = (1.0, 2.0, 0.5)
+- $e^{1.0} = 2.718$
+- $e^{2.0} = 7.389$
+- $e^{0.5} = 1.649$
+- 分母 = 2.718 + 7.389 + 1.649 = 11.756
+- p = (2.718 / 11.756, 7.389 / 11.756, 1.649 / 11.756) = (0.231, 0.628, 0.140)
+
+加起来：0.231 + 0.628 + 0.140 = 0.999 ✓
+
+### 为什么用 e^x 不是 x？
+
+如果直接用 $p_i = z_i / \sum z_j$：
+- z 可能是负数 → p 可能是负数（不是概率）
+- 即使全正，没有"放大差距"的效果
+
+$e^x$ 把任意实数映射到正数，且**指数放大差距**：
+- z 差 1 → p 比例差 e ≈ 2.7 倍
+- z 差 10 → p 比例差 22000 倍
+
+所以 logits 大的动作对应的 p 会**被压倒性地拉高**，符合"我更想选这个动作"的语义。
+
+### softmax 的"温度"
+
+加一个温度参数 T：
+$$
+p_i = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}}
+$$
+
+- T → 0：变 argmax（确定性，最大 z 的概率→1）
+- T = 1：标准 softmax
+- T → ∞：变均匀分布（探索）
+
+DQN 推断时 T → 0（贪心），训练时混合 ε-greedy 或 boltzmann（用 T）。
+
+### 在 RL 哪用到
+- DQN：Q(s, ·) 经过 softmax 变成 boltzmann 策略
+- Categorical 策略（CartPole 选左/右）的 actor 输出层
+- Cross-entropy loss 的"softmax + log" 一体化（数值稳定）
+
+---
+
+## §14 似然 / 最大似然 / 交叉熵 —— 把"loss 函数"统一起来
+
+这一节理解了，**90% 的 ML loss 你都能看懂**。
+
+### 似然（Likelihood）
+
+给定模型 $p_\theta$ 和一些观测数据 $\mathcal{D} = \{x_1, \ldots, x_N\}$，**似然** 是这个模型生成这些数据的概率：
+
+$$
+L(\theta) = p_\theta(\mathcal{D}) = \prod_{i=1}^{N} p_\theta(x_i)
+$$
+
+直觉：模型把数据当作"自己生成出来的可能性"。
+
+### 最大似然估计（Maximum Likelihood Estimation, MLE）
+
+找让 L(θ) 最大的 θ：
+
+$$
+\theta^* = \arg\max_\theta L(\theta)
+$$
+
+直觉：**调参数让模型最有可能生成观测到的数据**。
+
+### log 一下
+
+连乘容易下溢。取对数：
+$$
+\log L(\theta) = \sum_{i=1}^N \log p_\theta(x_i)
+$$
+
+最大化 log L 等价于最大化 L（log 单调）。
+
+### 等价于"最小化负 log 似然"
+
+$$
+\theta^* = \arg\min_\theta \; -\sum_i \log p_\theta(x_i)
+$$
+
+这个负 log 似然就是**交叉熵 loss**。
+
+### 交叉熵 = 负 log 似然 = ML 的统一 loss
+
+对分类（K 类，one-hot 标签 y）：
+
+$$
+\mathcal{L}_{\text{CE}} = -\sum_i \sum_{k=1}^K y_{i,k} \log p_\theta(k|x_i) = -\sum_i \log p_\theta(y_i | x_i)
+$$
+
+第二个等号用了 one-hot 性质：只有真实类 k = y_i 的项非零。
+
+**直接就是负 log 似然**！
+
+### 关系网
+
+```
+   最大似然估计 (MLE)
+         │
+         │ 取负 log
+         ▼
+   最小化负 log 似然
+         │
+         │ 在分类问题里就是
+         ▼
+   交叉熵 loss
+         │
+         │ 在高斯回归里（log p 含 (y-μ)²）
+         ▼
+   MSE loss
+```
+
+### 数学补丁：从 MLE 到 MSE
+
+如果模型假设 $y \sim \mathcal{N}(\mu_\theta(x), \sigma^2)$（固定 σ），
+
+$$
+\log p_\theta(y|x) = -\frac{(y - \mu_\theta(x))^2}{2\sigma^2} + \text{常数}
+$$
+
+最大化 log p 等价于最小化 $(y - \mu_\theta(x))^2$ —— **就是 MSE！**
+
+所以 MSE 不是凭空发明的，是**"假设高斯噪声"下的最大似然**。
+
+### 在 RL 哪用到
+- BC（L11）：MLE 拟合 expert action（连续 → MSE，离散 → CE）
+- RM 训练（L16）：Bradley-Terry 模型的 MLE → log sigmoid loss
+- DQN 的 V/Q 回归：假设 Bellman 残差是高斯 → MSE
+- 策略梯度：log π 出现在公式里就是因为 MLE 视角
+
+---
+
+## §15 多维高斯 / 协方差矩阵 —— 连续动作策略的数学
+
+### 一维高斯（复习）
+
+$$
+p(x) = \frac{1}{\sigma\sqrt{2\pi}} \exp\left(-\frac{(x-\mu)^2}{2\sigma^2}\right)
+$$
+
+### 多维高斯
+
+输入是向量 $\mathbf{x} \in \mathbb{R}^d$，参数是均值向量 μ 和协方差矩阵 Σ：
+
+$$
+p(\mathbf{x}) = \frac{1}{(2\pi)^{d/2}|\Sigma|^{1/2}} \exp\left(-\frac{1}{2}(\mathbf{x} - \mu)^T \Sigma^{-1}(\mathbf{x} - \mu)\right)
+$$
+
+公式吓人，**核心就一句话**：把 $(x - \mu)^2 / \sigma^2$ 推广到向量形式。
+
+### 协方差矩阵
+
+$\Sigma$ 是 d×d 矩阵：
+- 对角线 $\Sigma_{ii} = \text{Var}(x_i)$（每维的方差）
+- 非对角 $\Sigma_{ij} = \text{Cov}(x_i, x_j)$（i 维和 j 维的相关性）
+
+例子：2D 高斯，
+$$\Sigma = \begin{pmatrix} 1 & 0.5 \\ 0.5 & 2 \end{pmatrix}$$
+- $x_1$ 的方差 1，$x_2$ 的方差 2
+- 相关性 0.5（同向相关）
+
+形状直觉：等高线是椭圆，方向由 Σ 的特征向量决定。
+
+### 对角协方差（RL 实战常用）
+
+如果各维独立，Σ 是对角矩阵：
+$$\Sigma = \text{diag}(\sigma_1^2, \sigma_2^2, \ldots, \sigma_d^2)$$
+
+log 概率简化：
+$$
+\log p(\mathbf{x}) = -\sum_{i=1}^d \frac{(x_i - \mu_i)^2}{2\sigma_i^2} + \text{常数}
+$$
+
+各维独立求 log_prob 再加和——这就是 PPO/SAC 的 Gaussian policy 实战写法。
+
+### 在 RL 哪用到
+- 高斯策略输出 μ（d 维）和 σ（d 维），假设各维独立
+- SAC 的 reparameterization：$a = \mu + \sigma \odot \epsilon$，$\epsilon \sim \mathcal{N}(0, I_d)$
+- log_prob 是 d 维 log 概率求和
+
+### 协方差不为对角的情形（少见但有用）
+
+某些任务希望策略在动作空间"协调"——比如机械臂 6 DoF 不该独立动。
+方法：让网络输出 Cholesky 分解 L，Σ = L L^T。
+代价：参数量从 2d 变 d + d(d+1)/2，大幅膨胀。一般不用。
+
+---
+
+## §16 蒙特卡洛 vs TD —— 估计期望的两条路
+
+理解这一节，A2C / GAE / SAC 的 Q 估计就通了。
+
+### 问题
+
+要估计 $V(s) = \mathbb{E}\left[\sum_{t=0}^\infty \gamma^t r_t \mid s_0 = s\right]$。
+怎么从一条轨迹估计这个期望？
+
+### 路线 A：蒙特卡洛（MC）
+
+跑完整条 episode，用实际累积回报当 V 的估计：
+
+$$
+V_{\text{MC}}(s_0) = r_0 + \gamma r_1 + \gamma^2 r_2 + \cdots + \gamma^T r_T
+$$
+
+**特点**：
+- ✓ 无偏（期望就是 V）
+- ✗ 方差大（一条轨迹噪声大）
+- ✗ 必须等 episode 结束
+
+### 路线 B：TD（Temporal Difference）/ Bootstrapping
+
+只跑一步，用当前 V 的估计来"自举"未来：
+
+$$
+V_{\text{TD}}(s_0) = r_0 + \gamma V(s_1)
+$$
+
+**特点**：
+- ✗ 有偏（V(s_1) 本身是估计，不是真值）
+- ✓ 方差小（只看一步）
+- ✓ 不用等 episode 结束
+
+### 视觉对比
+
+```
+MC:  s_0 ──→ s_1 ──→ s_2 ──→ ... ──→ s_T (终止)
+     │                                    │
+     └────── 完整真实回报 G_0 ←───────────┘
+
+TD:  s_0 ──→ s_1
+     │       │
+     │       └─ 当前估计 V(s_1)（猜的）
+     └─ 估计 = r_0 + γ·V(s_1)
+```
+
+### n-step TD 折中
+
+跑 n 步再 bootstrap：
+$$
+V_{n}(s_0) = r_0 + \gamma r_1 + \cdots + \gamma^{n-1} r_{n-1} + \gamma^n V(s_n)
+$$
+
+n=1 → TD，n=∞ → MC。**n 越大方差越大、偏差越小**。
+
+### GAE = "n 平滑加权"
+
+GAE（L6）用 λ 加权所有 n-step：
+$$
+A^{\text{GAE}}_t = \sum_{l=0}^\infty (\gamma\lambda)^l \delta_{t+l}, \quad \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+$$
+
+λ=0 → 纯 TD，λ=1 → 纯 MC，0.95 是甜蜜点。
+
+### 在 RL 哪用到
+- DQN：1-step TD 估 Q
+- REINFORCE：MC 估 G
+- A2C / PPO：GAE 估 advantage
+- SAC：1-step TD 估 Q（同 DQN，但加熵项）
+- Dreamer：在 imagined rollout 上做 λ-return（GAE 推广）
+
+---
+
+## §17 完整 worked examples（手算 5 个公式）
+
+把前面的 16 节用具体数字串起来。每个例子代到代码里也能验。
+
+### 例 1：高斯策略的 log_prob
+
+策略 π = N(μ=0.5, σ=0.3)，采样到 a=0.8。
+
+$$
+\log p(a) = -\log(\sigma\sqrt{2\pi}) - \frac{(a-\mu)^2}{2\sigma^2}
+$$
+
+代入：
+- $-\log(0.3 \cdot 2.507) = -\log(0.752) = 0.285$
+- $-(0.8-0.5)^2 / (2 \cdot 0.09) = -0.09 / 0.18 = -0.5$
+- log_prob = 0.285 - 0.5 = **-0.215**
+
+PyTorch 验：
+```python
+import torch
+d = torch.distributions.Normal(0.5, 0.3)
+print(d.log_prob(torch.tensor(0.8)))  # tensor(-0.2153)
+```
+✓
+
+### 例 2：PPO 的 ratio + clip
+
+旧策略下 log_prob = -0.5，新策略下 log_prob = -0.3，advantage = 2.0，ε=0.2。
+
+ratio = exp(-0.3 - (-0.5)) = exp(0.2) = **1.221**
+- clip(1.221, 0.8, 1.2) = 1.2（被截）
+- surr1 = 1.221 × 2 = 2.442
+- surr2 = 1.2 × 2 = 2.4
+- min(surr1, surr2) = 2.4
+
+actor loss = -2.4
+
+直觉：advantage > 0（好动作），ratio 想往上涨，clip 限制不让走太远。
+
+### 例 3：GAE 展开（4 步）
+
+γ=0.9, λ=0.5, V(s_0..3) = (1, 1, 1, 1), rewards = (0, 1, 0, 0)。
+
+δ_0 = 0 + 0.9·1 - 1 = -0.1
+δ_1 = 1 + 0.9·1 - 1 = 0.9
+δ_2 = 0 + 0.9·1 - 1 = -0.1
+δ_3 = 0 + 0.9·0 - 1 = -1（假设 s_4 是终止 V=0）
+
+A_3 = δ_3 = -1
+A_2 = δ_2 + 0.45·A_3 = -0.1 + 0.45·(-1) = -0.55
+A_1 = δ_1 + 0.45·A_2 = 0.9 + 0.45·(-0.55) = 0.6525
+A_0 = δ_0 + 0.45·A_1 = -0.1 + 0.45·0.6525 = 0.194
+
+直觉：t=1 处 reward 突增（拿到 1），advantage 应该 > 0 ✓；t=3 episode 终止 V 应低 ✓。
+
+### 例 4：Bellman 方程在 5 格走廊上手算
+
+走廊：0 ←→ 1 ←→ 2 ←→ 3 ←→ 4(糖)
+γ=0.9, reward 移动=-1, 撞墙=0, 到糖=10。
+
+最优策略全往右。最优 V*(s)：
+- V*(4) = 0（终止）
+- V*(3) = 10 (直接到糖)
+- V*(2) = -1 + 0.9·10 = 8
+- V*(1) = -1 + 0.9·8 = 6.2
+- V*(0) = -1 + 0.9·6.2 = 4.58
+
+验证 Bellman：V*(1) = -1 + 0.9 · V*(2) = -1 + 0.9·8 = 6.2 ✓
+
+### 例 5：KL 散度具体数字
+
+p = (0.5, 0.5), q = (0.9, 0.1)
+
+$$
+D_{KL}(p \| q) = 0.5 \log\frac{0.5}{0.9} + 0.5 \log\frac{0.5}{0.1}
+$$
+= 0.5 · (-0.588) + 0.5 · 1.609
+= -0.294 + 0.805
+= **0.511**
+
+反过来：
+$$D_{KL}(q \| p) = 0.9 \log\frac{0.9}{0.5} + 0.1 \log\frac{0.1}{0.5}$$
+= 0.9 · 0.588 + 0.1 · (-1.609)
+= 0.529 - 0.161
+= **0.368**
+
+注意 D(p||q) ≠ D(q||p)，证明 KL 不对称。
+
+---
+
+## §18 梯度下降的几何 —— 神经网络训练直觉
+
+### 一维例子
+
+要最小化 $f(\theta) = \theta^2$。
+- 在 θ=3：导数 6（斜率正，函数右上）
+- 朝梯度反方向走：θ ← θ - lr · 6
+
+如果 lr = 0.1：
+- θ_0 = 3
+- θ_1 = 3 - 0.1·6 = 2.4
+- θ_2 = 2.4 - 0.1·4.8 = 1.92
+- θ_3 = 1.92 - 0.1·3.84 = 1.536
+- ... 指数衰减到 0
+
+```
+f(θ) = θ²
+                          
+       │             .
+       │            .
+       │           .
+   9 ──┤ ●──────.            ← 起点 θ=3
+       │   ╲ . 
+       │    ╲._         ← 沿负梯度走
+   1 ──┤      ●______       ← θ=2.4
+       │       ╲.───────●───→ θ=0
+       └──────────────────→ θ
+        0   1   2   3
+```
+
+### lr 太大 / 太小
+
+- lr 太小：每次走太少，要训练很久才收敛
+- lr 太大：会跨过最低点，甚至发散（θ 越来越大）
+
+经典数值实验：$f = \theta^2$，lr=1.1：
+- θ=3 → θ=3 - 1.1·6 = -3.6 → θ=-3.6 - 1.1·(-7.2) = 4.32 → ...
+
+绝对值越来越大，**发散**。这就是"lr 太大 NaN"的本质。
+
+### 多维：梯度向量
+
+二维例子：$f(\theta_1, \theta_2) = \theta_1^2 + 4\theta_2^2$
+- $\nabla f = (2\theta_1, 8\theta_2)$
+- 在 (1, 1)：梯度 = (2, 8)
+- 朝梯度反方向走：$(\theta_1, \theta_2) \leftarrow (1 - 0.1·2, 1 - 0.1·8) = (0.8, 0.2)$
+
+注意 θ_2 减少更快（系数 4），因为它在 f 里影响更大。
+
+### 在 RL 哪用到
+- 神经网络训练：训练就是梯度下降
+- lr 是几乎所有 RL 算法**最关键的超参**之一
+- "loss 不下降 / NaN" → 多半是 lr 选错了
+
+---
+
+## 一张图的关系网
+
+```
+   函数 / 导数 (§1) ──→ 链式法则 (§2) ──→ 反向传播
+       │
+       ▼
+   梯度 (§1) ──→ 梯度下降 (§18) ──→ 神经网络训练
+       │
+       ▼
+   期望 (§4) ←── 概率分布 (§3) ──→ 联合概率 (§6) ──→ 轨迹概率
+       │           │                              │
+       ▼           ▼                              │
+   方差        log 技巧 (§5) ──→ 期望的梯度 (§11) ──→ 策略梯度
+       │           │
+       ▼           ▼
+   降方差      Softmax (§13) ──→ 离散策略 / DQN
+       │           │
+       ▼           ▼
+   蒙特卡洛   似然 / 交叉熵 (§14) ──→ BC, RM, 分类全在这里
+   vs TD (§16)     │
+       │           ▼
+       │       MSE 损失（高斯版的 MLE）
+       ▼
+   GAE / A2C
+   
+   多维高斯 (§15) ──→ 连续动作策略 (PPO/SAC actor)
+   
+   矩阵 / 二次型 (§7) ──→ LQR
+   
+   熵 / KL (§8) ──→ SAC, PPO, RLHF, Dreamer
+   
+   重参数化 (§9) ──→ SAC, Diffusion
+   
+   重要性采样 (§10) ──→ PPO, off-policy
+   
+   大数定律 (§12) ──→ 一切"采样平均"的根
+```
+
+---
+
+## 还看不懂怎么办
+
+1. **跳过细节**：先承认"这个公式我先记直觉，回头再啃"，**继续往下读**。RL 不是数学考试。
+2. **找具体例子**：把抽象公式代入一个 3-5 维的例子手算一遍。
+3. **画图**：尤其是分布、梯度方向。
+4. **用 PyTorch 验算**：写 5 行代码看输出，比啃公式快。
+5. **隔几天再回来**：很多东西第一遍懵第二遍通是正常的。
+
+回到 [README](README.md) 继续学习。

@@ -1,0 +1,253 @@
+---
+title: "第 3 课：DQN（Deep Q-Network）★难"
+difficulty: 3
+prereq: []
+---
+# 第 3 课：DQN（Deep Q-Network）★难
+**导航**: [← L02 Q-learning](02_q_learning_tabular.md) · [目录](README.md) · [L04 REINFORCE →](04_reinforce.md)
+
+> 表格 Q-learning 在连续状态下崩了。这一课用神经网络逼近 Q 值。
+> 看似只是"换个 Q 的载体"，但**幼稚替换会发散**。DQN 的两个关键工程技巧（Replay Buffer + Target Network）就是为了让它别炸。
+
+> **前情提要**: L2 用表格解 5 格走廊，但表格放不下连续状态。这一课给'表'换成神经网络。
+
+---
+
+## 3.1 朴素思路与它为什么会爆
+
+把 $Q(s, a)$ 改成神经网络 $Q_\theta(s, a)$，损失函数就是 TD error 的平方：
+
+$$
+\mathcal{L}(\theta) = \mathbb{E}\left[(r + \gamma \max_{a'} Q_\theta(s', a') - Q_\theta(s, a))^2\right]
+$$
+
+直接对 θ 梯度下降。看起来很合理。**但实际跑一下就会发散**，原因有二：
+
+### 问题 1：样本相关性
+连续 step 的 (s, a, s', r) 高度相关（s' 就是下一时刻的 s）。SGD 假设样本独立同分布，相关样本让梯度估计有偏 + 高方差。
+
+### 问题 2：目标移动
+目标 $r + \gamma \max_{a'} Q_\theta(s', a')$ 里也含 θ。**你在追逐一个会跟你跑的目标**，和给手机自拍时镜头自己也在动一样难对焦。
+
+---
+
+## 3.2 两个修复 = DQN 的灵魂
+
+### 修复 1：Experience Replay
+所有 transition (s,a,r,s',done) 存进一个大缓冲区（比如 10 万容量）。每次训练**从里面均匀采小批量**。
+
+效果：打散时序相关性，样本接近独立。
+
+### 修复 2：Target Network
+维护两套权重：
+- $\theta$：在线网络，每步更新
+- $\theta^-$：目标网络，**冻结一段时间**（比如每 1000 步从 θ 复制一次）
+
+损失改成：
+$$
+\mathcal{L}(\theta) = \mathbb{E}\left[(r + \gamma \max_{a'} Q_{\theta^-}(s', a') - Q_\theta(s, a))^2\right]
+$$
+
+效果：目标几乎静止，θ 能稳定地朝它逼近。
+
+---
+
+## 3.3 完整 CartPole DQN（120 行）
+
+```python
+import gymnasium as gym
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from collections import deque
+import random
+
+# Q 网络
+class QNet(nn.Module):
+    def __init__(self, obs_dim, n_act):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, 128), nn.ReLU(),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, n_act),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+# Replay Buffer
+class Replay:
+    def __init__(self, cap=100000):
+        self.buf = deque(maxlen=cap)
+    def push(self, *t):
+        self.buf.append(t)
+    def sample(self, n):
+        b = random.sample(self.buf, n)
+        s, a, r, sn, d = zip(*b)
+        return (torch.tensor(np.array(s), dtype=torch.float32),
+                torch.tensor(a, dtype=torch.long),
+                torch.tensor(r, dtype=torch.float32),
+                torch.tensor(np.array(sn), dtype=torch.float32),
+                torch.tensor(d, dtype=torch.float32))
+    def __len__(self): return len(self.buf)
+
+# 训练
+env = gym.make("CartPole-v1")
+obs_dim = env.observation_space.shape[0]
+n_act = env.action_space.n
+
+q = QNet(obs_dim, n_act)
+target = QNet(obs_dim, n_act)
+target.load_state_dict(q.state_dict())
+opt = optim.Adam(q.parameters(), lr=1e-3)
+buf = Replay()
+
+gamma = 0.99
+batch_size = 64
+target_update = 100   # 每 100 步同步一次 target
+total_steps = 0
+
+for ep in range(500):
+    s, _ = env.reset()
+    ep_ret = 0
+    eps = max(0.05, 1.0 - ep / 200)
+    done = False
+    while not done:
+        if random.random() < eps:
+            a = env.action_space.sample()
+        else:
+            with torch.no_grad():
+                a = int(q(torch.tensor(s, dtype=torch.float32)).argmax())
+        sn, r, term, trunc, _ = env.step(a)
+        done = term or trunc
+        buf.push(s, a, r, sn, float(done))
+        s = sn
+        ep_ret += r
+
+        if len(buf) >= batch_size:
+            S, A, R, SN, D = buf.sample(batch_size)
+            with torch.no_grad():
+                target_q = R + gamma * target(SN).max(1).values * (1 - D)
+            pred = q(S).gather(1, A.unsqueeze(1)).squeeze()
+            loss = nn.functional.mse_loss(pred, target_q)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        total_steps += 1
+        if total_steps % target_update == 0:
+            target.load_state_dict(q.state_dict())
+
+    if ep % 20 == 0:
+        print(f"ep {ep}, return {ep_ret:.1f}, eps {eps:.2f}")
+```
+
+跑 500 episodes 大约能学到 200+ 平均回报（满分 500）。
+
+---
+
+## 3.4 几个隐藏的工程细节
+
+1. **`with torch.no_grad()` 包目标计算**：否则 target 会被加进计算图，梯度乱传。
+2. **`(1 - D)` 处理终止状态**：终止后没有"下一步"，target = R 而非 R + γ·...。
+3. **gather 操作**：`q(S)` 出来是 (batch, n_act)，要按 A 索引取出 Q(s,a)。
+4. **梯度裁剪**（这个版本没加，进阶时建议加）：`torch.nn.utils.clip_grad_norm_(q.parameters(), 10)`。
+
+---
+
+## 3.5 改进：Double DQN
+
+朴素 DQN 的 max 算子有**正向偏差**：
+
+$$
+\max_a Q_{\theta^-}(s', a) \quad \text{倾向于高估}
+$$
+
+因为如果 Q 估值有噪声，max 会挑出"运气好被高估的"那个动作。
+
+**Double DQN** 的解法：动作选择用 θ，价值评估用 θ⁻。
+
+```python
+# 原版
+target_q = R + gamma * target(SN).max(1).values * (1 - D)
+
+# Double DQN
+next_actions = q(SN).argmax(1, keepdim=True)         # 用在线网络选动作
+target_q = R + gamma * target(SN).gather(1, next_actions).squeeze() * (1 - D)
+```
+
+实测在 CartPole 提升不大，但在 Atari 一类高维任务上重要。
+
+---
+
+## 3.6 卡点 FAQ
+
+**Q1：训练曲线为什么是先涨后崩再涨的过山车？**
+A：DQN 在没收敛前 Q 估值偏差大，target 跳来跳去。Replay Buffer 大一点 + Target Update 频率低一点 + 更小学习率（1e-4）能压住。如果反复崩，加 Double DQN 或换 PPO。
+
+**Q2：为什么我的 DQN 一开始 reward 很低还在下降？**
+A：正常的。前期是探索 + 网络在乱学。一般要 3-5 万步才看到稳定提升。看 1000 步内的曲线没意义。
+
+**Q3：reward 已经达到 200 多，为什么会突然掉到 30？**
+A：经典 catastrophic forgetting。目标网络更新时 weights 突变，Q 函数地形也突变。解决：减小 target_update 频率（比如改成软更新 τ=0.005），或减小学习率。
+
+**Q4：Replay Buffer 多大才够？**
+A：连续控制类任务一般 1e5-1e6。太小（< 1万）相关性还在，太大（> 1e7）老数据不准。CartPole 用 1e5 完全够。
+
+**Q5：DQN 能做连续动作吗？**
+A：原生不能（max 算子在连续空间没法穷举）。需要 DDPG / SAC / TD3 这类 Actor-Critic。见 Lesson 10。
+
+---
+
+## 3.7 常见 Bug 实录
+
+| 现象 | 原因 | 修法 |
+|---|---|---|
+| Loss 一直涨 | 没 detach target / 漏了 no_grad | 检查 target 计算是否在 no_grad 块内 |
+| Reward 永远是负 | done 时漏乘 (1-D) | 终止状态 target = R，别加 γ·V(s') |
+| 一开始就 NaN | reward 没归一化 / lr 太大 | reward clip 到 [-1, 1] 或 lr 降到 1e-4 |
+| Replay 里全是同一种 state | reset 后没 push 新 transition | 确保每次 step 都 push |
+| GPU 不动 / 慢 | 数据没搬到 GPU | `.to(device)` 加在 model 和 tensor 上 |
+| 看不出探索效果 | ε 衰减太快 | 前 1 万步保持 ε ≥ 0.5 |
+| Buffer 警告 "deque len changing during iteration" | 多线程乱写 | 单线程跑或用 lock |
+
+---
+
+## 3.8 调参手册（按重要性）
+
+| 超参 | 推荐值 | 调节方向 |
+|---|---|---|
+| 学习率 lr | 1e-3 (CartPole), 1e-4 (Atari) | 不收敛降，太慢升 |
+| γ | 0.99 | 短任务 0.95，长任务 0.999 |
+| Replay 容量 | 1e5 ~ 1e6 | 状态空间小取小 |
+| batch size | 64 ~ 256 | 越大越稳但越慢 |
+| Target update 频率 | 每 100~1000 步硬更新 / τ=0.005 软更新 | 不稳就调慢 |
+| ε 起始 | 1.0 | 几乎不调 |
+| ε 结束 | 0.01 ~ 0.1 | 不调 |
+| ε 衰减步数 | 1万 ~ 10万 | 任务难就久 |
+| 网络宽度 | 64 ~ 256 | 大没用，先调超参 |
+
+**调参流程建议**：
+1. 先跑默认值（上面推荐值）
+2. 看 5000 步是否有上升趋势 → 没有先看 reward 是否合理
+3. 上升但崩 → 降 lr 或加 Double DQN
+4. 上升慢 → 加 batch size，加 buffer
+5. **不要**第一时间改网络结构，99% 问题是超参 / 实现 bug
+
+---
+
+## 本课收获
+
+> DQN 的灵魂不是神经网络，而是 **Replay Buffer + Target Network**。少一个就发散。
+
+## 3.9 思考题
+
+1. 为什么 Replay Buffer 要随机采样而不是按顺序？
+2. Target Network 每 1000 步硬同步 vs 每步软同步 (τ=0.005)，本质上是否等价？
+3. Double DQN 解决"过估计"的核心是什么？为什么"分开选动作和评估价值"就够了？
+4. 如果环境是非平稳的（reward 函数会变），Replay Buffer 会带来什么问题？
+5. **开放题**：把 DQN 改造成处理"机械臂关节角离散化（每个关节 5 档）"的 6 关节任务。状态 6 维，动作空间 5^6=15625。直接 DQN 还能用吗？为什么？
+
+---
+
+下一课：[第 4 课：REINFORCE](04_reinforce.md)
