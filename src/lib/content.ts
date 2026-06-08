@@ -23,6 +23,12 @@ export function listSubjects(): Subject[] {
     });
 }
 
+export function getSubject(slug: string): Subject {
+  const found = listSubjects().find((s) => s.slug === slug);
+  if (!found) throw new Error(`未知学科: ${slug}`);
+  return found;
+}
+
 export type Lesson = {
   subject: string;
   slug: string;
