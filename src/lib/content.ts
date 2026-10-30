@@ -23,10 +23,8 @@ export function listSubjects(): Subject[] {
     });
 }
 
-export function getSubject(slug: string): Subject {
-  const found = listSubjects().find((s) => s.slug === slug);
-  if (!found) throw new Error(`未知学科: ${slug}`);
-  return found;
+export function getSubject(slug: string): Subject | undefined {
+  return listSubjects().find((s) => s.slug === slug);
 }
 
 export type Lesson = {
@@ -38,7 +36,9 @@ export type Lesson = {
   content: string; // 原始 MDX 正文(不含 frontmatter)
 };
 
-export function getLesson(subject: string, slug: string): Lesson {
+export function getLesson(subject: string, slug: string): Lesson | undefined {
+  // Only published lessons may be resolved to filesystem paths.
+  if (!getSubject(subject)?.order.includes(slug)) return undefined;
   const raw = fs.readFileSync(
     path.join(CONTENT_DIR, subject, `${slug}.mdx`),
     "utf8",

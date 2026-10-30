@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { notFound } from "next/navigation";
 import { getSubject, getLesson } from "@/lib/content";
 
 export default async function SubjectPage({
@@ -8,6 +9,7 @@ export default async function SubjectPage({
 }) {
   const { subject } = await params;
   const meta = getSubject(subject);
+  if (!meta) notFound();
   return (
     <main className="mx-auto max-w-3xl p-8">
       <Link href="/" className="text-sm text-blue-600">← 返回</Link>
@@ -15,6 +17,7 @@ export default async function SubjectPage({
       <ol className="space-y-2">
         {meta.order.map((slug, i) => {
           const lesson = getLesson(subject, slug);
+          if (!lesson) notFound();
           return (
             <li key={slug}>
               <Link href={`/${subject}/${slug}`} className="text-blue-600 hover:underline">

@@ -12,7 +12,7 @@
 | 了解操作策略与具身模型 | [模仿学习](content/rl/11_imitation_learning.mdx) → [Diffusion Policy](content/rl/13_diffusion_policy.mdx) → [世界模型](content/rl/14_world_models.mdx) → [VLA](content/rl/15_vla.mdx) |
 | 回查概念或训练问题 | [算法对照](content/rl/algorithms_at_a_glance.mdx) · [符号表](content/rl/notation_cheatsheet.mdx) · [排障指南](content/rl/debugging_guide.mdx) |
 
-完整顺序由 [`content/rl/_meta.json`](content/rl/_meta.json) 维护；所有课文见 [`content/rl/`](content/rl/)。运行训练代码前先读[环境准备](content/rl/00_linux_setup.mdx)，[习题解答](content/rl/solutions.mdx)留到自答后核对。教程练习不等于已经完成机器人实机验证。
+完整顺序由 [`content/rl/_meta.json`](content/rl/_meta.json) 维护；所有课文见[课程目录](content/rl/README.md)。运行训练代码前先读[环境准备](content/rl/00_linux_setup.mdx)，[习题解答](content/rl/solutions.mdx)留到自答后核对。教程练习不等于已经完成机器人实机验证。
 
 ## 在本机阅读
 
@@ -48,10 +48,12 @@ npm start
 
 新增课文时参考现有 frontmatter，填写 `title`，按需要填写 `difficulty` 与 `prereq`，并把不带扩展名的文件名加入 `_meta.json` 的 `order`。只添加 MDX 文件而不更新目录，课文不会出现在正常课程列表里。
 
+正文保留一个 `# 课文标题`。课间链接使用真实文件名，例如 `06_ppo.mdx`，返回目录使用 `README.md`；网站渲染时会转换成课程地址并保留小节锚点，直接在 GitHub 阅读也能跳转。新增课文后同步更新 `content/rl/README.md`。表格按 Markdown 表格写，标题自动生成与 GitHub 一致的锚点。
+
 ```bash
 npm test
 npm run lint
 npm run build
 ```
 
-已有单元测试覆盖内容读取的基本行为；通过它不代表所有课文、公式或训练示例已经验证。修改课文后仍需打开对应页面检查公式与链接；修改算法示例后按课文条件运行。涉及 API、模型能力或工具版本时核对原始来源并记录适用版本。
+测试逐课检查标题、公式渲染错误、课程文件链接和中文小节锚点，并覆盖未知课程与目录外路径。通过渲染检查不代表算法推导或训练示例已经验证；修改算法示例后仍需按课文条件运行。涉及 API、模型能力或工具版本时核对原始来源并记录适用版本。
